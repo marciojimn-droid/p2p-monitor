@@ -1,0 +1,46 @@
+{
+  "fee_binance_pct": 0.25,
+  "fee_bybit_pct": 0.0,
+  "capital_bob": 15000,
+  "capital_usdt": 300,
+  "trade_amount_bob": 3000,
+  "usdt_transfer_fee": 1.0,
+  "transfer_size_usdt": 300,
+  "min_monthly_orders": 30,
+  "min_finish_rate": 0.9,
+  "maker_rank": 3,
+  "history_max": 4000,
+  "alerts": {
+    "move_pct_30m": 0.5,
+    "move_pct_2h": 0.9,
+    "arb_net_pct": 0.3,
+    "maker_net_pct": 0.3,
+    "taker_net_pct": 0.2,
+    "price_above": null,
+    "price_below": null,
+    "rsi_overbought": 70,
+    "rsi_oversold": 30,
+    "cooldown_min": {
+      "move": 45,
+      "arb": 30,
+      "maker": 60,
+      "taker": 30,
+      "signal": 120,
+      "level": 120,
+      "news": 360
+    }
+  },
+  "news": {
+    "enabled": true,
+    "max_age_hours": 48,
+    "queries": [
+      "dólar paralelo Bolivia",
+      "tipo de cambio Bolivia dólar",
+      "Banco Central de Bolivia reservas dólares",
+      "Bolivia escasez de dólares combustible",
+      "site:eldeber.com.bo economía dólar",
+      "site:reduno.com.bo economía dólar",
+      "site:unitel.bo economía dólar"
+    ]
+  }
+}
