@@ -19,6 +19,7 @@ Uso:
 import argparse
 import hashlib
 import json
+import math
 import os
 import random
 import re
@@ -48,6 +49,8 @@ DEFAULTS = {
     "min_finish_rate": 0.9,
     "maker_rank": 3,
     "history_max": 4000,
+    "live_seconds": 120,
+    "live_refresh_seconds": 60,
     "alerts": {
         "move_pct_30m": 0.5,
         "move_pct_2h": 0.9,
@@ -59,7 +62,7 @@ DEFAULTS = {
         "rsi_overbought": 70,
         "rsi_oversold": 30,
         "cooldown_min": {"move": 45, "arb": 30, "maker": 60, "taker": 30,
-                         "signal": 120, "level": 120, "news": 360},
+                         "signal": 120, "level": 120, "news": 360, "rule": 0},
     },
     "news": {"enabled": True, "max_age_hours": 48, "queries": []},
 }
@@ -594,7 +597,12 @@ class Alerter:
         self.last = state.setdefault("alert_last", {})
         self.log = state.setdefault("log", [])
 
+    def muted(self):
+        return self.now.timestamp() < self.state.get("muted_until", 0)
+
     def fire(self, key, kind, text):
+        if kind in self.state.get("auto_off", []) or self.muted():
+            return False
         cd = self.cfg["alerts"]["cooldown_min"].get(kind, 60) * 60
         t = self.now.timestamp()
         if t - self.last.get(key, 0) < cd:
@@ -606,18 +614,8 @@ class Alerter:
         return True
 
 
-def evaluate_alerts(al, cfg, ta, scen, opps, news, platforms, price, prev_label):
+def evaluate_opp_alerts(al, cfg, opps):
     a = cfg["alerts"]
-    for win, key, thr in ((30, "change_30m_pct", a["move_pct_30m"]), (120, "change_2h_pct", a["move_pct_2h"])):
-        ch = ta.get(key)
-        if ch is not None and abs(ch) >= thr:
-            up = ch > 0
-            al.fire(f"move:{'up' if up else 'down'}", "move",
-                    f"{'📈 SUBE' if up else '📉 BAJA'} el USDT: {ch:+.2f}% en {win} min → {price:.3f} Bs")
-    if a.get("price_above") and price >= a["price_above"]:
-        al.fire("level:above", "level", f"🔔 USDT superó {a['price_above']} Bs (ahora {price:.3f})")
-    if a.get("price_below") and price <= a["price_below"]:
-        al.fire("level:below", "level", f"🔔 USDT cayó bajo {a['price_below']} Bs (ahora {price:.3f})")
     for o in opps["arbitrage"]:
         if o["net_pct"] >= a["arb_net_pct"]:
             al.fire(f"arb:{o['buy_on']}", "arb",
@@ -634,6 +632,21 @@ def evaluate_alerts(al, cfg, ta, scen, opps, news, platforms, price, prev_label)
             al.fire(f"maker:{o['platform']}", "maker",
                     f"🧩 SPREAD en {o['platform'].title()}: publica compra ≈ {o['buy_price']:.2f} y venta ≈ {o['sell_price']:.2f} "
                     f"→ neto {o['net_pct']:+.2f}% por ciclo (≈ Bs {o['est_bob']:+,.0f}).")
+
+
+def evaluate_alerts(al, cfg, ta, scen, opps, news, platforms, price, prev_label):
+    a = cfg["alerts"]
+    for win, key, thr in ((30, "change_30m_pct", a["move_pct_30m"]), (120, "change_2h_pct", a["move_pct_2h"])):
+        ch = ta.get(key)
+        if ch is not None and abs(ch) >= thr:
+            up = ch > 0
+            al.fire(f"move:{'up' if up else 'down'}", "move",
+                    f"{'📈 SUBE' if up else '📉 BAJA'} el USDT: {ch:+.2f}% en {win} min → {price:.3f} Bs")
+    if a.get("price_above") and price >= a["price_above"]:
+        al.fire("level:above", "level", f"🔔 USDT superó {a['price_above']} Bs (ahora {price:.3f})")
+    if a.get("price_below") and price <= a["price_below"]:
+        al.fire("level:below", "level", f"🔔 USDT cayó bajo {a['price_below']} Bs (ahora {price:.3f})")
+    evaluate_opp_alerts(al, cfg, opps)
     if scen["strong"] and scen["label"] != prev_label:
         al.fire(f"signal:{scen['label']}", "signal",
                 f"🧭 Escenario {scen['label']} (score {scen['score']:+.0f}, confianza {scen['confidence']}).\n- " +
@@ -659,45 +672,43 @@ class Telegram:
     def enabled(self):
         return bool(self.token and self.chat)
 
-    def api(self, method, payload):
-        return json.loads(http(f"https://api.telegram.org/bot{self.token}/{method}", payload, timeout=15, retries=1))
+    def api(self, method, payload, timeout=15, retries=1):
+        return json.loads(http(f"https://api.telegram.org/bot{self.token}/{method}", payload,
+                                timeout=timeout, retries=retries))
 
-    def send(self, text):
+    def send(self, text, kb=None, edit=None):
+        """Envía un mensaje (o edita uno existente si se da 'edit'). 'kb' = botones."""
         if self.dry or not self.enabled:
-            print("[ALERTA]", text.replace("\n", " | "))
-            return
+            print("[TG]", text.replace("\n", " | ")[:400])
+            return None
+        payload = {"chat_id": self.chat, "text": text[:4000], "disable_web_page_preview": True}
+        if kb:
+            payload["reply_markup"] = kb
         try:
-            self.api("sendMessage", {"chat_id": self.chat, "text": text[:4000], "disable_web_page_preview": True})
+            if edit:
+                payload["message_id"] = edit
+                return self.api("editMessageText", payload, retries=0)
+            return self.api("sendMessage", payload)
         except Exception as e:  # noqa: BLE001
-            print("Telegram error:", e, file=sys.stderr)
+            body = ""
+            try:
+                body = e.read().decode("utf-8", "ignore")
+            except Exception:  # noqa: BLE001
+                pass
+            if edit and "not modified" in body:
+                return None
+            if edit:
+                return self.send(text, kb)  # el mensaje viejo ya no se puede editar: enviar uno nuevo
+            print("Telegram error:", e, body[:200], file=sys.stderr)
+            return None
 
-    def poll_commands(self, state, make_report):
-        if not self.enabled or self.dry:
+    def answer(self, cb_id, text=""):
+        if self.dry or not self.enabled:
             return
         try:
-            r = self.api("getUpdates", {"offset": state.get("tg_offset", 0), "timeout": 0,
-                                        "allowed_updates": ["message"]})
-        except Exception as e:  # noqa: BLE001
-            print("Telegram getUpdates error:", e, file=sys.stderr)
-            return
-        for u in (r.get("result") or [])[-8:]:
-            state["tg_offset"] = u["update_id"] + 1
-            m = u.get("message") or {}
-            if str((m.get("chat") or {}).get("id")) != str(self.chat):
-                continue
-            if time.time() - m.get("date", 0) > 1800:
-                continue
-            t = norm(m.get("text") or "")
-            if t.startswith("/start") or t.startswith("/ayuda") or t.startswith("/help"):
-                self.send("Comandos:\n/estado  (o escribe: análisis mercado P2P)\n/oportunidades\n/noticias")
-            elif "analisis mercado p2p" in t or t.startswith("/estado") or t.startswith("/analisis"):
-                self.send(make_report("full"))
-            elif t.startswith("/oportunidades"):
-                self.send(make_report("opps"))
-            elif t.startswith("/noticias"):
-                self.send(make_report("news"))
-        if r.get("result"):
-            state["tg_offset"] = r["result"][-1]["update_id"] + 1
+            self.api("answerCallbackQuery", {"callback_query_id": cb_id, "text": text}, retries=0)
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def make_report(kind, latest):
@@ -735,6 +746,599 @@ def make_report(kind, latest):
     if kind == "full":
         lines.append("\nNo es asesoría financiera.")
     return "\n".join(lines)
+
+
+# ───────────────────────── alertas del usuario + bot con botones ─────────────────────────
+
+PLAT = {"binance": "Binance", "bybit": "Bybit"}
+PLAT_CODES = {"b": ["binance"], "y": ["bybit"], "a": ["binance", "bybit"]}
+PLAT_WORDS = {"binance": ["binance"], "bybit": ["bybit"], "ambas": ["binance", "bybit"],
+              "ambos": ["binance", "bybit"], "todas": ["binance", "bybit"], "ambas.": ["binance", "bybit"]}
+UP_WORDS_CMD = {"sube", "subir", "sobre", "arriba", "mayor", "encima", "supera", "alza"}
+DOWN_WORDS_CMD = {"baja", "bajar", "bajo", "abajo", "menor", "debajo", "cae", "caiga"}
+AUTO = {"move": "Movimiento del precio", "arb": "Arbitraje Binance↔Bybit", "taker": "Cruce directo",
+        "maker": "Spread como maker", "signal": "Señales y escenario", "news": "Noticias de impacto"}
+AUTO_SHORT = {"move": "Movimiento", "arb": "Arbitraje", "taker": "Cruce", "maker": "Maker",
+              "signal": "Señales", "news": "Noticias"}
+AUTO_ALIASES = {"movimiento": "move", "mov": "move", "arbitraje": "arb", "cruce": "taker", "taker": "taker",
+                "maker": "maker", "senales": "signal", "senal": "signal", "noticias": "news", "noticia": "news"}
+FOREVER = 4102444800  # año 2100: "pausa hasta que yo la reanude"
+MAX_RULES = 20
+UI_VERSION = 2
+
+BOT_COMMANDS = [
+    ("menu", "Menú principal"), ("precios", "Precios y spread Binance/Bybit"), ("alertas", "Mis alertas activas"),
+    ("nueva", "Crear una alerta con botones"), ("compra", "Alerta de precio de compra"),
+    ("venta", "Alerta de precio de venta"), ("spread", "Ver spread o crear alerta de spread"),
+    ("desactivar", "Desactivar una alerta o todas"), ("activar", "Activar una alerta o todas"),
+    ("borrar", "Borrar una alerta"), ("pausar", "Pausar todas las alertas"),
+    ("estado", "Análisis del mercado"), ("noticias", "Noticias que mueven el dólar"),
+]
+COMMAND_WORDS = {"compra", "venta", "spread", "desactivar", "activar", "borrar", "quitar", "eliminar", "pausar",
+                 "reanudar", "mov", "precios", "precio", "alertas", "alerta", "menu", "ayuda", "help", "estado",
+                 "noticias", "oportunidades", "nueva", "start", "analisis", "apagar", "encender"}
+KEYWORDS = [("analisis mercado p2p", "estado"), ("mis alertas", "alertas"), ("nueva alerta", "nueva"),
+            ("precios", "precios"), ("noticias", "noticias"), ("oportunidades", "oportunidades"),
+            ("reanudar", "reanudar"), ("pausar", "pausar"), ("analisis", "estado")]
+
+HELP_TEXT = (
+    "🤖 Comandos\n\n"
+    "Ver\n"
+    "/precios → compra, venta y spread en Binance y Bybit\n"
+    "/alertas → tus alertas activas (con botones)\n"
+    "/estado → análisis del mercado · /noticias\n\n"
+    "Crear alertas\n"
+    "/nueva → paso a paso con botones\n"
+    "/compra binance sube 12 → avisa si el precio de COMPRA llega a 12 o más\n"
+    "/compra bybit baja 11.50 → avisa si baja a 11.50 o menos\n"
+    "/venta binance sube 12 · /venta bybit baja 11.5\n"
+    "/spread binance 1.2 → avisa si el spread llega a 1.2% o más\n"
+    "(en vez de binance o bybit puedes escribir «ambas»)\n\n"
+    "Administrar\n"
+    "/desactivar 3 · /activar 3 · /borrar 3 (3 = número de la alerta)\n"
+    "/desactivar todas · /activar todas · /borrar todas\n"
+    "/desactivar movimiento (también: arbitraje, cruce, maker, senales, noticias)\n"
+    "/pausar 2h · /reanudar\n"
+    "/mov 0.3 → sensibilidad del aviso de movimiento (% en 30 min)\n\n"
+    "Compra = lo que pagas por cada USDT. Venta = lo que recibes por cada USDT. "
+    "Spread = (compra ÷ venta − 1) en %."
+)
+
+
+def btn(text, data):
+    return {"text": text, "callback_data": data}
+
+
+def ikb(*rows):
+    return {"inline_keyboard": [list(r) for r in rows]}
+
+
+HOME = btn("🏠 Menú", "m")
+MAIN_KB = ikb([btn("💱 Precios y spread", "p"), btn("🔔 Mis alertas", "l")],
+              [btn("➕ Nueva alerta", "n"), btn("⏸ Pausar", "z")],
+              [btn("📊 Análisis", "an"), btn("📰 Noticias", "nw")])
+REPLY_KB = {"keyboard": [[{"text": "💱 Precios"}, {"text": "🔔 Mis alertas"}],
+                         [{"text": "➕ Nueva alerta"}, {"text": "⏸ Pausar"}],
+                         [{"text": "📊 Análisis"}, {"text": "📰 Noticias"}]],
+            "resize_keyboard": True, "is_persistent": True}
+
+
+def parse_float(s):
+    try:
+        v = float(str(s).replace("%", "").replace(",", ".").strip())
+    except ValueError:
+        return None
+    return v if math.isfinite(v) else None
+
+
+def spread_pct(p):
+    """Spread = cuánto más caro es comprar que vender: (compra ÷ venta − 1) × 100."""
+    return (p["best_buy"] / p["best_sell"] - 1) * 100
+
+
+def maker_net_pct(p, fee):
+    """Margen neto de comisión si publicas tus anuncios en el tope de cada lado."""
+    return (p["best_buy"] * (1 - fee)) / (p["best_sell"] * (1 + fee)) - 1
+
+
+def rule_text(r):
+    p = PLAT[r["platform"]]
+    if r["type"] == "spread":
+        return f"{p} · spread ≥ {r['level']:g}%"
+    side = "COMPRA" if r["side"] == "compra" else "VENTA"
+    verb = "sube de" if r["dir"] == "sube" else "baja de"
+    return f"{p} · precio de {side} {verb} {r['level']:.2f}"
+
+
+def rule_value(r, platforms):
+    p = (platforms or {}).get(r["platform"])
+    if not p:
+        return None
+    if r["type"] == "spread":
+        return spread_pct(p)
+    return p["best_buy"] if r["side"] == "compra" else p["best_sell"]
+
+
+def rule_hit(r, v):
+    if r["type"] == "spread" or r["dir"] == "sube":
+        return v >= r["level"]
+    return v <= r["level"]
+
+
+def fmt_val(r, v):
+    return f"{v:.2f}%" if r["type"] == "spread" else f"{v:.2f}"
+
+
+def rule_alert_text(r, v, platforms, cfg):
+    p = platforms[r["platform"]]
+    f = cfg[f"fee_{r['platform']}_pct"] / 100
+    ctx = f"Compra {p['best_buy']:.2f} · Venta {p['best_sell']:.2f}"
+    if r["type"] == "spread":
+        body = f"Spread ahora: {v:.2f}% (neto tras comisión ≈ {maker_net_pct(p, f) * 100:+.2f}%)\n{ctx}"
+    else:
+        body = f"Ahora: {v:.2f} Bs\n{ctx}"
+    return f"🔔 Alerta #{r['id']}: {rule_text(r)}\n{body}"
+
+
+def evaluate_rules(al, state, platforms):
+    """Dispara las alertas del usuario al cruzar su nivel; se rearman cuando el precio vuelve atrás."""
+    for r in state.get("rules", []):
+        if not r.get("active", True):
+            r["on"] = False
+            continue
+        v = rule_value(r, platforms)
+        if v is None:
+            continue
+        if rule_hit(r, v):
+            if not r.get("on") and al.fire(f"rule:{r['id']}", "rule", rule_alert_text(r, v, platforms, al.cfg)):
+                r["on"] = True
+        else:
+            r["on"] = False
+
+
+def prices_text(platforms, cfg, ts, stale=False):
+    L = [f"💱 USDT/BOB · {fmt_local(ts)}" + (" (dato anterior)" if stale else ""),
+         "Compra = lo que pagas por USDT · Venta = lo que recibes"]
+    for n in ("binance", "bybit"):
+        p = platforms.get(n)
+        L.append("")
+        if not p:
+            L.append(f"{PLAT[n]}: sin datos")
+            continue
+        f = cfg[f"fee_{n}_pct"] / 100
+        L += [PLAT[n],
+              f"  Compra: {p['best_buy']:.2f}   Venta: {p['best_sell']:.2f}",
+              f"  Spread: {spread_pct(p):+.2f}% (Bs {p['best_buy'] - p['best_sell']:+.2f})",
+              f"  Neto tras comisión si publicas tus anuncios: {maker_net_pct(p, f) * 100:+.2f}%"]
+    arb = opportunities(platforms, cfg)["arbitrage"]
+    if arb:
+        L += ["", "Entre plataformas (neto de comisión)"]
+        for a in arb:
+            L.append(f"  {PLAT[a['buy_on']]} → {PLAT[a['sell_on']]}: {a['net_pct']:+.2f}% (≈ Bs {a['est_bob']:+,.0f})")
+    return "\n".join(L)
+
+
+class Bot:
+    """Menú y comandos de Telegram. Guarda todo en 'state' (se publica en la rama data)."""
+
+    def __init__(self, tg, cfg, state, ctx):
+        self.tg, self.cfg, self.state, self.ctx = tg, cfg, state, ctx
+        state.setdefault("rules", [])
+        state.setdefault("next_id", 1)
+        state.setdefault("auto_off", [])
+        state.setdefault("muted_until", 0)
+
+    # ── lectura de mensajes ──────────────────────────────────────────
+
+    def poll(self, timeout=0):
+        try:
+            r = self.tg.api("getUpdates", {"offset": self.state.get("tg_offset", 0), "timeout": timeout,
+                                           "allowed_updates": ["message", "callback_query"]},
+                            timeout=timeout + 12, retries=0)
+        except Exception as e:  # noqa: BLE001
+            print("Telegram getUpdates error:", e, file=sys.stderr)
+            return None
+        n = 0
+        for u in r.get("result") or []:
+            self.state["tg_offset"] = u["update_id"] + 1
+            try:
+                self.process_update(u)
+            except Exception as e:  # noqa: BLE001
+                print("bot error:", repr(e), file=sys.stderr)
+            n += 1
+        return n
+
+    def process_update(self, u):
+        if "callback_query" in u:
+            cb = u["callback_query"]
+            msg = cb.get("message") or {}
+            if str((msg.get("chat") or {}).get("id")) != str(self.tg.chat):
+                return
+            self.tg.answer(cb.get("id"))
+            self.on_callback(cb.get("data") or "", msg.get("message_id"))
+            return
+        m = u.get("message") or {}
+        if str((m.get("chat") or {}).get("id")) != str(self.tg.chat):
+            return
+        if time.time() - m.get("date", 0) > 3600:
+            return
+        if (m.get("text") or "").strip():
+            self.on_text(m["text"].strip())
+
+    # ── texto y comandos ─────────────────────────────────────────────
+
+    def on_text(self, raw):
+        t = norm(raw).strip()
+        t = re.sub(r"^(/\w+)@\w+", r"\1", t)
+        parts = t.split()
+        if not parts:
+            return
+        pend = self.state.get("pending")
+        if pend and not t.startswith("/") and parse_float(t) is not None:
+            self.state["pending"] = None
+            return self.add_rules(pend["t"], PLAT_CODES[pend["p"]], pend.get("d"), parse_float(t))
+        if t.startswith("/"):
+            cmd, args = parts[0][1:], parts[1:]
+        elif parts[0] in COMMAND_WORDS:
+            cmd, args = parts[0], parts[1:]
+        else:
+            cmd, args = None, []
+            for key, c in KEYWORDS:
+                if key in t:
+                    cmd = c
+                    break
+        self.state["pending"] = None
+        h = {"start": lambda: self.menu(start=True), "menu": self.menu, "ayuda": self.help, "help": self.help,
+             "precios": self.show_prices, "precio": self.show_prices, "alertas": self.show_alerts,
+             "alerta": self.show_alerts, "nueva": self.wizard_start,
+             "estado": lambda: self.report("full"), "analisis": lambda: self.report("full"),
+             "oportunidades": lambda: self.report("opps"), "noticias": lambda: self.report("news"),
+             "reanudar": self.resume}.get(cmd)
+        if h:
+            return h()
+        if cmd in ("compra", "venta"):
+            return self.cmd_price(cmd, args)
+        if cmd == "spread":
+            return self.cmd_spread(args) if args else self.show_prices()
+        if cmd in ("desactivar", "apagar"):
+            return self.cmd_toggle(args, False)
+        if cmd in ("activar", "encender"):
+            return self.cmd_toggle(args, True)
+        if cmd in ("borrar", "quitar", "eliminar"):
+            return self.cmd_delete(args)
+        if cmd == "pausar":
+            return self.cmd_pause(args)
+        if cmd == "mov":
+            return self.cmd_mov(args)
+        self.tg.send("No entendí 🤔 Usa los botones o escribe /ayuda.", MAIN_KB)
+
+    def parse_args(self, args):
+        plats, d, level = None, None, None
+        for a in args:
+            if a in PLAT_WORDS:
+                plats = PLAT_WORDS[a]
+            elif a in UP_WORDS_CMD:
+                d = "u"
+            elif a in DOWN_WORDS_CMD:
+                d = "d"
+            elif parse_float(a) is not None:
+                level = parse_float(a)
+        return plats or ["binance", "bybit"], d, level
+
+    def cmd_price(self, side, args):
+        plats, d, level = self.parse_args(args)
+        if d is None or level is None:
+            return self.tg.send(f"Uso: /{side} binance sube 12   ·   /{side} bybit baja 11.50\n"
+                                "(en vez de binance o bybit puedes poner «ambas»)", ikb([HOME]))
+        self.add_rules("c" if side == "compra" else "v", plats, d, level)
+
+    def cmd_spread(self, args):
+        plats, _, level = self.parse_args(args)
+        if level is None:
+            return self.tg.send("Uso: /spread binance 1.2   ·   /spread ambas 1\n"
+                                "Te aviso cuando el spread llegue a ese % o más.", ikb([HOME]))
+        self.add_rules("s", plats, None, level)
+
+    def find_rule(self, arg):
+        if arg.isdigit():
+            for r in self.state["rules"]:
+                if r["id"] == int(arg):
+                    return r
+        return None
+
+    def cmd_toggle(self, args, on):
+        st, verb = self.state, ("activada" if on else "desactivada")
+        if not args:
+            return self.tg.send("Uso: /desactivar 3 · /desactivar movimiento · /desactivar todas\n"
+                                "(el número lo ves en /alertas)", ikb([btn("🔔 Mis alertas", "l"), HOME]))
+        w = args[0]
+        kb = ikb([btn("🔔 Mis alertas", "l"), HOME])
+        if w in ("todas", "todo", "todos"):
+            if on:
+                st["muted_until"], st["auto_off"] = 0, []
+                for r in st["rules"]:
+                    r["active"] = True
+                return self.tg.send("✅ Todas las alertas activadas.", kb)
+            st["muted_until"] = FOREVER
+            return self.tg.send("🔇 Todas las alertas desactivadas (tus configuraciones se conservan).\n"
+                                "Para volver: /activar todas", kb)
+        r = self.find_rule(w)
+        if r:
+            r["active"], r["on"] = on, False
+            extra = "\n⚠️ Ojo: las alertas están en pausa general (/activar todas)." if on and self.muted() else ""
+            return self.tg.send(f"{'✅' if on else '⏹'} Alerta #{r['id']} {verb}: {rule_text(r)}{extra}", kb)
+        key = AUTO_ALIASES.get(w)
+        if key:
+            if on and key in st["auto_off"]:
+                st["auto_off"].remove(key)
+            elif not on and key not in st["auto_off"]:
+                st["auto_off"].append(key)
+            return self.tg.send(f"{'✅' if on else '⏹'} {AUTO[key]}: {verb}.", kb)
+        self.tg.send("No encontré esa alerta. Mira los números en /alertas.", kb)
+
+    def cmd_delete(self, args):
+        st, kb = self.state, ikb([btn("🔔 Mis alertas", "l"), HOME])
+        if not args:
+            return self.tg.send("Uso: /borrar 3 · /borrar todas", kb)
+        if args[0] in ("todas", "todo", "todos"):
+            n = len(st["rules"])
+            st["rules"] = []
+            return self.tg.send(f"🗑 Borré {n} alerta(s) tuya(s).", kb)
+        r = self.find_rule(args[0])
+        if not r:
+            return self.tg.send("No encontré esa alerta. Mira los números en /alertas.", kb)
+        st["rules"].remove(r)
+        self.tg.send(f"🗑 Alerta #{r['id']} borrada: {rule_text(r)}", kb)
+
+    def cmd_pause(self, args):
+        if not args:
+            return self.pause_menu()
+        m = re.match(r"^(\d+(?:[.,]\d+)?)(h|hr|hrs|hora|horas|m|min|minutos?)?$", "".join(args))
+        if not m:
+            return self.tg.send("Uso: /pausar 2h · /pausar 30m", ikb([HOME]))
+        n = float(m.group(1).replace(",", "."))
+        secs = n * 60 if (m.group(2) or "h").startswith("m") else n * 3600
+        self.pause_for(secs)
+
+    def cmd_mov(self, args):
+        v = parse_float(args[0]) if args else None
+        if v is None or not (0.05 <= v <= 5):
+            cur = self.cfg["alerts"]["move_pct_30m"]
+            return self.tg.send(f"Uso: /mov 0.3 → avisa si el precio se mueve 0.3% en 30 min (y 0.6% en 2 h).\n"
+                                f"Ahora: {cur}% (entre 0.05 y 5).", ikb([HOME]))
+        st = self.state.setdefault("settings", {})
+        st["move_pct_30m"], st["move_pct_2h"] = round(v, 3), round(v * 2, 3)
+        self.cfg["alerts"].update(st)
+        self.tg.send(f"✅ Aviso de movimiento: {v:g}% en 30 min o {v * 2:g}% en 2 h.", ikb([HOME]))
+
+    # ── pausa ────────────────────────────────────────────────────────
+
+    def muted(self):
+        return time.time() < self.state.get("muted_until", 0)
+
+    def pause_for(self, secs, edit=None):
+        self.state["muted_until"] = time.time() + secs
+        until = datetime.fromtimestamp(self.state["muted_until"], timezone.utc)
+        self.tg.send(f"⏸ Alertas en pausa hasta las {fmt_local(until)}. Para volver antes: /reanudar",
+                     ikb([btn("▶ Reanudar", "u"), HOME]), edit)
+
+    def pause_menu(self, edit=None):
+        self.tg.send("⏸ ¿Por cuánto tiempo pauso TODAS las alertas?",
+                     ikb([btn("1 h", "z:1"), btn("4 h", "z:4"), btn("8 h", "z:8")],
+                         [btn("Hasta que las reanude", "z:f")], [btn("▶ Reanudar ahora", "u"), HOME]), edit)
+
+    def resume(self, edit=None):
+        self.state["muted_until"] = 0
+        self.tg.send("▶ Alertas reanudadas.", ikb([btn("🔔 Mis alertas", "l"), HOME]), edit)
+
+    # ── pantallas ────────────────────────────────────────────────────
+
+    def help(self, edit=None):
+        self.tg.send(HELP_TEXT, ikb([HOME]), edit)
+
+    def menu(self, start=False, edit=None):
+        n = sum(1 for r in self.state["rules"] if r.get("active", True))
+        if start:
+            self.tg.send("👋 Menú actualizado: ahora puedes crear y administrar alertas con botones.\n"
+                         "Usa los botones de abajo, o escribe «/» para ver todos los comandos.", REPLY_KB)
+        txt = "🤖 Monitor P2P USDT/BOB\n"
+        txt += "🔇 Alertas en pausa\n" if self.muted() else ""
+        txt += f"Tienes {n} alerta(s) tuya(s) activa(s).\n¿Qué quieres hacer?"
+        self.tg.send(txt, MAIN_KB, None if start else edit)
+
+    def show_prices(self, edit=None):
+        platforms, ts, stale = self.ctx["refresh"]()
+        kb = ikb([btn("🔄 Actualizar", "p"), btn("➕ Alerta", "n")], [btn("🔔 Mis alertas", "l"), HOME])
+        if not platforms:
+            return self.tg.send("No pude leer los precios ahora (Binance y Bybit no respondieron). Prueba en un minuto.",
+                                kb, edit)
+        self.tg.send(prices_text(platforms, self.cfg, ts, stale), kb, edit)
+
+    def report(self, kind):
+        lat = self.ctx["latest"]()
+        if not lat or "scenario" not in lat:
+            return self.tg.send("Todavía no tengo datos de mercado completos. Prueba en unos minutos.", ikb([HOME]))
+        self.tg.send(make_report(kind, lat), ikb([HOME]))
+
+    def show_alerts(self, edit=None):
+        st, a = self.state, self.cfg["alerts"]
+        mu = st.get("muted_until", 0)
+        L = ["🔔 Tus alertas"]
+        if time.time() < mu:
+            L.append("🔇 TODAS en pausa " + ("hasta que las reanudes" if mu >= FOREVER - 1 else
+                                            f"hasta las {fmt_local(datetime.fromtimestamp(mu, timezone.utc))}"))
+        else:
+            L.append("✅ Funcionando")
+        L += ["", "Las tuyas:"]
+        if not st["rules"]:
+            L.append("  (ninguna todavía) → toca ➕ Nueva alerta")
+        for r in st["rules"]:
+            tail = " · ya disparada (se rearma sola)" if r.get("on") and r.get("active", True) else ""
+            L.append(f"#{r['id']} {'✅' if r.get('active', True) else '⏹'} {rule_text(r)}{tail}")
+        detail = {"move": f"({a['move_pct_30m']:g}% en 30 min · {a['move_pct_2h']:g}% en 2 h)",
+                  "arb": f"(neto ≥ {a['arb_net_pct']:g}%)", "taker": f"(neto ≥ {a['taker_net_pct']:g}%)",
+                  "maker": f"(neto ≥ {a['maker_net_pct']:g}%)"}
+        L += ["", "Automáticas:"]
+        for k, name in AUTO.items():
+            L.append(f"{'⏹' if k in st['auto_off'] else '✅'} {name} {detail.get(k, '')}".rstrip())
+        rows = []
+        for r in st["rules"]:
+            rows.append([btn(f"{'⏹ Pausar' if r.get('active', True) else '▶ Activar'} #{r['id']}", f"t:{r['id']}"),
+                         btn(f"🗑 Borrar #{r['id']}", f"d:{r['id']}")])
+        ks = list(AUTO)
+        for i in range(0, len(ks), 3):
+            rows.append([btn(f"{'⏹' if k in st['auto_off'] else '✅'} {AUTO_SHORT[k]}", f"x:{k}") for k in ks[i:i + 3]])
+        rows.append([btn("➕ Nueva alerta", "n"),
+                     btn("▶ Reanudar" if time.time() < mu else "⏸ Pausar todo", "u" if time.time() < mu else "z")])
+        rows.append([HOME])
+        self.tg.send("\n".join(L), ikb(*rows), edit)
+
+    # ── asistente de nueva alerta ────────────────────────────────────
+
+    def cur_price(self, plat, typ):
+        p = (self.ctx["platforms"]() or {}).get(plat)
+        return None if not p else (p["best_buy"] if typ == "c" else p["best_sell"])
+
+    def wizard_start(self, edit=None):
+        self.state["pending"] = None
+        self.tg.send("➕ Nueva alerta\n\n• Precio de COMPRA: lo que pagas por cada USDT.\n"
+                     "• Precio de VENTA: lo que recibes por cada USDT.\n"
+                     "• Spread: diferencia % entre ambos (más alto = más margen para ti).\n\n"
+                     "¿Sobre qué quieres la alerta?",
+                     ikb([btn("Precio de compra", "n:c"), btn("Precio de venta", "n:v")], [btn("Spread", "n:s")],
+                         [HOME]), edit)
+
+    def wizard(self, a, edit):
+        if len(a) < 2 or a[1] not in ("c", "v", "s"):
+            return self.wizard_start(edit)
+        typ = a[1]
+        tname = {"c": "precio de COMPRA", "v": "precio de VENTA", "s": "spread"}[typ]
+        if len(a) == 2:
+            return self.tg.send(f"Alerta de {tname}\n¿En qué plataforma?",
+                                ikb([btn("Binance", f"n:{typ}:b"), btn("Bybit", f"n:{typ}:y"),
+                                     btn("Ambas", f"n:{typ}:a")], [btn("⬅️ Atrás", "n"), HOME]), edit)
+        plat = a[2]
+        if plat not in PLAT_CODES:
+            return self.wizard_start(edit)
+        plats = PLAT_CODES[plat]
+        pname = {"b": "Binance", "y": "Bybit", "a": "Binance y Bybit"}[plat]
+        if typ == "s":
+            if len(a) == 3:
+                self.state["pending"] = {"t": "s", "p": plat}
+                return self.tg.send(f"Spread en {pname}\nTe aviso cuando sea igual o mayor a:\n"
+                                    "Elige un valor o escribe el % (ej. 1.2).\n"
+                                    "💡 Con comisión de 0.25% por lado, bajo 0.5% no hay ganancia.",
+                                    ikb([btn(f"{v}%", f"n:s:{plat}:{v}") for v in ("0.5", "1", "1.5", "2")],
+                                        [btn("⬅️ Atrás", "n:s"), HOME]), edit)
+            self.state["pending"] = None
+            return self.add_rules("s", plats, None, parse_float(a[3]), edit)
+        if len(a) == 3:
+            return self.tg.send(f"{pname} · {tname}\n¿Cuándo te aviso?",
+                                ikb([btn("📈 Cuando sube de", f"n:{typ}:{plat}:u"),
+                                     btn("📉 Cuando baja de", f"n:{typ}:{plat}:d")],
+                                    [btn("⬅️ Atrás", f"n:{typ}"), HOME]), edit)
+        d = a[3]
+        if d not in ("u", "d"):
+            return self.wizard_start(edit)
+        if len(a) == 4:
+            cur = self.cur_price(plats[0], typ)
+            self.state["pending"] = {"t": typ, "p": plat, "d": d}
+            sign = 1 if d == "u" else -1
+            rows = []
+            if cur:
+                rows.append([btn(f"{cur + sign * x:.2f}", f"n:{typ}:{plat}:{d}:{cur + sign * x:.2f}")
+                             for x in (0.05, 0.10, 0.20)])
+            rows.append([btn("⬅️ Atrás", f"n:{typ}:{plat}"), HOME])
+            return self.tg.send(f"{pname} · {tname} {'sube de' if d == 'u' else 'baja de'} …\n"
+                                + (f"Ahora está en {cur:.2f}\n" if cur else "")
+                                + "Elige un nivel o escribe el precio (ej. 12.00).", ikb(*rows), edit)
+        self.state["pending"] = None
+        self.add_rules(typ, plats, d, parse_float(a[4]), edit)
+
+    def add_rules(self, typ, plats, d, level, edit=None):
+        kb = ikb([btn("🔔 Mis alertas", "l"), btn("➕ Otra", "n")], [HOME])
+        if level is None or level <= 0 or (typ == "s" and level > 50) or (typ != "s" and level > 10000):
+            return self.tg.send("Ese valor no es válido. Ejemplo: 12.00 (o 1.2 para un spread en %).", kb, edit)
+        st, platforms = self.state, self.ctx["platforms"]()
+        made, notes = [], []
+        for pl in plats:
+            if len(st["rules"]) >= MAX_RULES:
+                notes.append(f"Máximo {MAX_RULES} alertas: borra alguna para crear más.")
+                break
+            r = {"id": st["next_id"], "type": "spread" if typ == "s" else "price", "platform": pl,
+                 "level": round(level, 4), "active": True, "on": False}
+            if typ != "s":
+                r["side"], r["dir"] = ("compra" if typ == "c" else "venta"), ("sube" if d == "u" else "baja")
+            v = rule_value(r, platforms)
+            if v is not None and rule_hit(r, v):
+                r["on"] = True
+                notes.append(f"Ojo: en {PLAT[pl]} ya está en {fmt_val(r, v)}, o sea que ya se cumple. "
+                             "Te aviso la próxima vez que vuelva a cruzar ese nivel.")
+            st["next_id"] += 1
+            st["rules"].append(r)
+            made.append(r)
+        if not made:
+            return self.tg.send("\n".join(notes), kb, edit)
+        txt = "✅ Alerta creada:\n" + "\n".join(f"#{r['id']} {rule_text(r)}" for r in made)
+        if notes:
+            txt += "\n\n" + "\n".join(notes)
+        self.tg.send(txt, kb, edit)
+
+    # ── botones ──────────────────────────────────────────────────────
+
+    def on_callback(self, data, mid):
+        a, st = data.split(":"), self.state
+        k = a[0]
+        if k == "m":
+            return self.menu(edit=mid)
+        if k == "p":
+            return self.show_prices(edit=mid)
+        if k == "l":
+            return self.show_alerts(edit=mid)
+        if k == "n":
+            return self.wizard(a, mid)
+        if k in ("t", "d") and len(a) == 2 and a[1].isdigit():
+            r = self.find_rule(a[1])
+            if r and k == "t":
+                r["active"], r["on"] = not r.get("active", True), False
+            elif r:
+                st["rules"].remove(r)
+            return self.show_alerts(edit=mid)
+        if k == "x" and len(a) == 2 and a[1] in AUTO:
+            if a[1] in st["auto_off"]:
+                st["auto_off"].remove(a[1])
+            else:
+                st["auto_off"].append(a[1])
+            return self.show_alerts(edit=mid)
+        if k == "z":
+            if len(a) == 1:
+                return self.pause_menu(mid)
+            if a[1] == "f":
+                st["muted_until"] = FOREVER
+                return self.show_alerts(edit=mid)
+            if a[1].isdigit():
+                return self.pause_for(int(a[1]) * 3600, mid)
+        if k == "u":
+            return self.resume(mid)
+        if k == "an":
+            return self.report("full")
+        if k == "nw":
+            return self.report("news")
+        if k == "op":
+            return self.report("opps")
+
+    # ── primera vez tras actualizar ──────────────────────────────────
+
+    def first_run_setup(self):
+        if self.state.get("ui_v") == UI_VERSION:
+            return
+        self.state["ui_v"] = UI_VERSION
+        try:
+            self.tg.api("setMyCommands", {"commands": [{"command": c, "description": d} for c, d in BOT_COMMANDS]},
+                        retries=0)
+        except Exception as e:  # noqa: BLE001
+            print("setMyCommands:", e, file=sys.stderr)
+        self.menu(start=True)
 
 
 # ───────────────────────── modo demo ─────────────────────────
@@ -779,14 +1383,56 @@ def demo_data(cfg, hist_len_h=340):
 
 # ───────────────────────── programa principal ─────────────────────────
 
+def get_platforms(cfg, errors, ws_token):
+    platforms, used_ws = {}, False
+    b = collect_binance(cfg, errors)
+    if b is None and ws_token:
+        b = wavesoft_latest(cfg, ws_token, errors)
+        used_ws = b is not None
+    if b:
+        platforms["binance"] = b
+    y = collect_bybit(cfg, errors)
+    if y:
+        platforms["bybit"] = y
+    return platforms, used_ws
+
+
+def live_loop(bot, al, state, cfg, refresh, deadline, data):
+    """Mantiene el bot escuchando Telegram (respuesta casi inmediata) y revisa tus alertas cada minuto."""
+    tick = time.time() + cfg["live_refresh_seconds"]
+    while True:
+        remaining = deadline - time.time()
+        if remaining <= 4:
+            break
+        try:
+            n = bot.poll(timeout=int(max(0, min(20, remaining - 3))))
+            if n is None:
+                time.sleep(3)
+            elif n:
+                write_json(data / "state.json", state)
+            if time.time() >= tick and deadline - time.time() > 10:
+                tick = time.time() + cfg["live_refresh_seconds"]
+                platforms, _ts, stale = refresh()
+                if platforms and not stale:
+                    al.now = now_utc()
+                    evaluate_rules(al, state, platforms)
+                    evaluate_opp_alerts(al, cfg, opportunities(platforms, cfg))
+                    write_json(data / "state.json", state)
+        except Exception as e:  # noqa: BLE001
+            print("live error:", repr(e), file=sys.stderr)
+            time.sleep(3)
+
+
 def main():
+    t0 = time.time()
     ap = argparse.ArgumentParser()
     ap.add_argument("--data", default="data", help="carpeta con el estado previo y salida")
     ap.add_argument("--demo", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--live", type=int, default=None, help="segundos escuchando Telegram (0 = no escuchar)")
     args = ap.parse_args()
 
-    cfg = load_config()
+    cfg = json.loads(json.dumps(load_config()))
     data = Path(args.data)
     data.mkdir(parents=True, exist_ok=True)
     now = now_utc().replace(microsecond=0)
@@ -794,24 +1440,17 @@ def main():
 
     hist = read_json(data / "history.json", [])
     state = read_json(data / "state.json", {})
+    cfg["alerts"].update(state.get("settings", {}))
+    live = args.live if args.live is not None else int(os.environ.get("LIVE_SECONDS") or cfg["live_seconds"])
     tg = Telegram(os.environ.get("TELEGRAM_BOT_TOKEN"), os.environ.get("TELEGRAM_CHAT_ID"), args.dry_run or args.demo)
     ws_token = os.environ.get("WAVESOFT_TOKEN")
     used_wavesoft = False
+    news, latest = [], read_json(data / "latest.json", {})
 
     if args.demo:
-        platforms, news, demo_hist = demo_data(cfg)
-        hist = demo_hist
+        platforms, news, hist = demo_data(cfg)
     else:
-        platforms = {}
-        b = collect_binance(cfg, errors)
-        if b is None and ws_token:
-            b = wavesoft_latest(cfg, ws_token, errors)
-            used_wavesoft = b is not None
-        if b:
-            platforms["binance"] = b
-        y = collect_bybit(cfg, errors)
-        if y:
-            platforms["bybit"] = y
+        platforms, used_wavesoft = get_platforms(cfg, errors, ws_token)
         news = fetch_news(cfg, errors)
         if ws_token and not state.get("seeded"):
             seed = wavesoft_seed(ws_token, errors)
@@ -821,67 +1460,80 @@ def main():
                 state["seeded"] = True
                 used_wavesoft = True
 
+    al = Alerter(cfg, state, tg.send, now)
+
     if not platforms:
-        latest = read_json(data / "latest.json", {})
         latest["status"] = {"ok": False, "errors": errors, "checked_at": iso(now)}
         write_json(data / "latest.json", latest)
-        write_json(data / "state.json", state)
         print("Sin datos de ninguna plataforma:", errors, file=sys.stderr)
-        return 0
+    else:
+        # registro del historial
+        rec = {"t": iso(now)}
+        if "binance" in platforms:
+            p = platforms["binance"]
+            rec.update({"br": round(p["ref"], 4), "bb": p["best_buy"], "bs": p["best_sell"]})
+        if "bybit" in platforms:
+            p = platforms["bybit"]
+            rec.update({"yr": round(p["ref"], 4), "yb": p["best_buy"], "ys": p["best_sell"]})
+        hist.append(rec)
+        hist = hist[-cfg["history_max"]:]
 
-    # registro del historial
-    ref = (platforms.get("binance") or platforms.get("bybit"))["ref"]
-    rec = {"t": iso(now)}
-    if "binance" in platforms:
-        p = platforms["binance"]
-        rec.update({"br": round(p["ref"], 4), "bb": p["best_buy"], "bs": p["best_sell"]})
-    if "bybit" in platforms:
-        p = platforms["bybit"]
-        rec.update({"yr": round(p["ref"], 4), "yb": p["best_buy"], "ys": p["best_sell"]})
-    hist.append(rec)
-    hist = hist[-cfg["history_max"]:]
+        price = rec.get("br") or rec.get("yr")
+        ta = technical_analysis(hist, price, now)
+        pressure = depth_pressure(platforms)
+        scen = build_scenario(ta, news, pressure)
+        opps = opportunities(platforms, cfg)
+        signals = build_signals(ta, scen, cfg)
+        prev_label = state.get("scenario_label")
 
-    price = rec.get("br") or rec.get("yr")
-    ta = technical_analysis(hist, price, now)
-    pressure = depth_pressure(platforms)
-    scen = build_scenario(ta, news, pressure)
-    opps = opportunities(platforms, cfg)
-    signals = build_signals(ta, scen, cfg)
-    prev_label = state.get("scenario_label")
+        latest = {
+            "generated_at": iso(now),
+            "config": {k: cfg[k] for k in ("fee_binance_pct", "fee_bybit_pct", "capital_bob", "capital_usdt",
+                                           "trade_amount_bob", "usdt_transfer_fee", "transfer_size_usdt")},
+            "price": price,
+            "platforms": platforms,
+            "ta": ta,
+            "scenario": scen,
+            "opportunities": opps,
+            "signals": signals,
+            "news": news[:15],
+            "alerts": [],
+            "status": {"ok": True, "errors": errors, "demo": args.demo, "wavesoft": used_wavesoft,
+                       "telegram": tg.enabled, "checked_at": iso(now)},
+        }
 
-    latest = {
-        "generated_at": iso(now),
-        "config": {k: cfg[k] for k in ("fee_binance_pct", "fee_bybit_pct", "capital_bob", "capital_usdt",
-                                       "trade_amount_bob", "usdt_transfer_fee", "transfer_size_usdt")},
-        "price": price,
-        "platforms": platforms,
-        "ta": ta,
-        "scenario": scen,
-        "opportunities": opps,
-        "signals": signals,
-        "news": news[:15],
-        "alerts": [],
-        "status": {"ok": True, "errors": errors, "demo": args.demo, "wavesoft": used_wavesoft,
-                   "telegram": tg.enabled, "checked_at": iso(now)},
-    }
+        evaluate_alerts(al, cfg, ta, scen, opps, news, platforms, price, prev_label)
+        evaluate_rules(al, state, platforms)
+        state["scenario_label"] = scen["label"] if scen["strong"] else (prev_label or scen["label"])
+        latest["alerts"] = list(reversed(state.get("log", [])))[:30]
 
-    al = Alerter(cfg, state, tg.send, now)
-    evaluate_alerts(al, cfg, ta, scen, opps, news, platforms, price, prev_label)
-    state["scenario_label"] = scen["label"] if scen["strong"] else (prev_label or scen["label"])
-    latest["alerts"] = list(reversed(state.get("log", [])))[:30]
+        # series ligeras para el gráfico del panel
+        m5 = [r for r in hist if not r.get("seed")][-288:]
+        chart = {"m5": m5, "h1": [{"t": t, "p": p} for t, p in hourly_series(hist)][-336:]}
+        write_json(data / "latest.json", latest)
+        write_json(data / "chart.json", chart)
+        write_json(data / "history.json", hist)
+        print(f"OK {fmt_local(now)} ref={price:.3f} escenario={scen['label']}({scen['score']:+.0f}) "
+              f"plataformas={list(platforms)} errores={len(errors)}")
 
-    tg.poll_commands(state, lambda kind: make_report(kind, latest))
+    # ── Telegram interactivo: menú, botones y alertas del usuario ──
+    cur = {"platforms": platforms, "ts": now}
 
-    # series ligeras para el gráfico del panel
-    m5 = [r for r in hist if not r.get("seed")][-288:]
-    chart = {"m5": m5, "h1": [{"t": t, "p": p} for t, p in hourly_series(hist)][-336:]}
+    def refresh():
+        p, _ = get_platforms(cfg, [], ws_token)
+        if p:
+            cur["platforms"], cur["ts"] = p, now_utc()
+        return cur["platforms"], cur["ts"], not p
 
-    write_json(data / "latest.json", latest)
-    write_json(data / "chart.json", chart)
-    write_json(data / "history.json", hist)
+    bot = Bot(tg, cfg, state, {"platforms": lambda: cur["platforms"], "refresh": refresh,
+                               "latest": lambda: latest})
+    if tg.enabled and not args.demo and not args.dry_run:
+        bot.first_run_setup()
+        if live > 0:
+            live_loop(bot, al, state, cfg, refresh, t0 + live, data)
+        else:
+            bot.poll(0)
     write_json(data / "state.json", state)
-    print(f"OK {fmt_local(now)} ref={price:.3f} escenario={scen['label']}({scen['score']:+.0f}) "
-          f"plataformas={list(platforms)} errores={len(errors)}")
     return 0
 
 
