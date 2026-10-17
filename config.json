@@ -11,13 +11,13 @@
   "maker_rank": 3,
   "history_max": 4000,
   "alerts": {
-    "move_pct_30m": 0.5,
-    "move_pct_2h": 0.9,
+    "move_pct_30m": 0.3,
+    "move_pct_2h": 0.6,
     "arb_net_pct": 0.3,
     "maker_net_pct": 0.3,
     "taker_net_pct": 0.2,
-    "price_above": null,
-    "price_below": null,
+    "price_above": 12.00,
+    "price_below": 11.60,
     "rsi_overbought": 70,
     "rsi_oversold": 30,
     "cooldown_min": {
