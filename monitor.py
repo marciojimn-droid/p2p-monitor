@@ -64,7 +64,30 @@ DEFAULTS = {
         "cooldown_min": {"move": 45, "arb": 30, "maker": 60, "taker": 30,
                          "signal": 120, "level": 120, "news": 360, "rule": 0},
     },
-    "news": {"enabled": True, "max_age_hours": 48, "queries": []},
+    "news": {
+        "enabled": True, "max_age_hours": 72, "max_items": 8, "min_score": 7, "important_score": 10,
+        "alert_max_age_hours": 6, "alert_gap_min": 90,
+        "searches": [
+            {"q": 'Bolivia "tipo de cambio" dólar paralelo', "when": "2d"},
+            {"q": 'Bolivia dólares reservas "Banco Central de Bolivia"', "when": "2d"},
+            {"q": "Bolivia escasez de dólares divisas", "when": "2d"},
+            {"q": 'Bolivia préstamo BID OR CAF OR "Banco Mundial" OR FMI desembolso', "when": "7d"},
+            {"q": "Bolivia financiamiento externo crédito aprobado", "when": "7d"},
+            {"q": "Bolivia bonos deuda calificación Fitch OR Moody's", "when": "7d"},
+            {"q": "Bolivia diésel gasolina YPFB importación combustible", "when": "2d"},
+            {"q": "Bolivia subvención combustibles decreto", "when": "3d"},
+            {"q": "precio del petróleo Brent OPEP", "when": "1d"},
+            {"q": "flete marítimo contenedores navieras", "when": "2d"},
+            {"q": 'Mar Rojo OR "Canal de Suez" OR "Canal de Panamá" OR Ormuz navieras', "when": "2d"},
+            {"q": "puertos Arica Iquique carga boliviana", "when": "3d"},
+            {"q": "Bolivia bloqueos paro economía pérdidas", "when": "2d"},
+            {"q": "Bolivia inflación PIB déficit fiscal", "when": "3d"},
+            {"q": "Bolivia exportaciones gas litio soya remesas", "when": "3d"},
+            {"q": "site:eldeber.com.bo economía dólar", "when": "2d"},
+            {"q": "site:reduno.com.bo economía dólar", "when": "2d"},
+            {"q": "site:unitel.bo economía dólar", "when": "2d"},
+        ],
+    },
 }
 
 
@@ -302,21 +325,37 @@ def wavesoft_seed(token, errors):
 
 
 # ───────────────────────── noticias ─────────────────────────
+# Objetivo: pocas noticias, pero que de verdad muevan el tipo de cambio en Bolivia.
+#   1) Se buscan con consultas dirigidas (cambiario, préstamos, combustibles, petróleo, flete, economía).
+#   2) Cada titular recibe un puntaje de relevancia; lo que no habla de Bolivia (o de petróleo/flete
+#      en un movimiento grande, con fuente seria) se descarta.
+#   3) Se agrupan las repetidas (misma noticia en varios medios) y se muestran solo las más importantes.
 
-UP_WORDS = {  # empujan el dólar/USDT al alza
+UP_WORDS = {  # empujan el dólar/USDT al alza en Bolivia
     "escasez de dolar": 2, "falta de dolar": 2, "faltan dolares": 2, "devaluacion": 2, "dolar sube": 2,
-    "dolar paralelo sube": 2, "suben el dolar": 2, "sube el dolar": 2, "bloqueo": 1, "bloqueos": 1, "paro": 1,
-    "crisis": 1, "inflacion": 1, "reservas caen": 2, "caida de reservas": 2, "reservas bajan": 2,
-    "deficit": 1, "subvencion": 1, "restriccion": 1, "incertidumbre": 1, "conflicto": 1, "protesta": 1,
-    "desabastecimiento": 1, "filas": 1, "racionamiento": 1, "sanciones": 1, "default": 2,
-    "calificacion negativa": 2, "rebaja de calificacion": 2, "tension": 1, "corrida": 2, "cepo": 1,
+    "dolar paralelo sube": 2, "sube el dolar": 2, "suben el dolar": 2, "dolar se dispara": 2,
+    "reservas caen": 2, "caida de reservas": 2, "reservas bajan": 2, "reservas se agotan": 2,
+    "bloqueo": 1, "bloqueos": 1, "paro": 1, "huelga": 1, "crisis": 1, "inflacion": 1, "deficit": 1,
+    "subvencion": 1, "restriccion": 1, "incertidumbre": 1, "conflicto": 1, "protesta": 1,
+    "desabastecimiento": 1, "falta de diesel": 2, "escasez de diesel": 2, "escasez de combustible": 2,
+    "filas": 1, "racionamiento": 1, "sanciones": 1, "default": 2, "calificacion negativa": 2,
+    "rebaja la nota": 2, "rebaja de calificacion": 2, "baja la calificacion": 2, "corrida": 2, "cepo": 1,
+    "brent sube": 2, "petroleo sube": 2, "brent se dispara": 2, "petroleo se dispara": 2, "crudo sube": 2,
+    "fletes suben": 2, "flete sube": 2, "fletes se disparan": 2, "encarece": 1, "encarecen": 1,
+    "pago de deuda": 1, "vencimiento de bonos": 1, "mar rojo": 1, "ormuz": 1, "importacion de combustible": 1,
 }
-DOWN_WORDS = {  # empujan el dólar/USDT a la baja
-    "dolar baja": 2, "baja el dolar": 2, "bajan el dolar": 2, "cae el dolar": 2, "liberacion de dolares": 2,
-    "ingreso de dolares": 2, "mas dolares": 1, "oferta de dolares": 1, "credito": 1, "desembolso": 2,
-    "prestamo": 1, "fmi": 1, "acuerdo": 1, "estabilidad cambiaria": 2, "reservas suben": 2,
+DOWN_WORDS = {  # empujan el dólar/USDT a la baja en Bolivia
+    "dolar baja": 2, "baja el dolar": 2, "bajan el dolar": 2, "cae el dolar": 2, "dolar cae": 2,
+    "liberacion de dolares": 2, "ingreso de dolares": 2, "llegan dolares": 2, "recibe dolares": 2,
+    "mas dolares": 1, "oferta de dolares": 1, "desembolso": 2, "desembolsa": 2, "desembolsara": 1,
+    "aprueba prestamo": 2, "aprueba credito": 2, "aprobo prestamo": 2, "aprueba financiamiento": 2,
+    "financiamiento aprobado": 2, "prestamo aprobado": 2, "acuerdo con el fmi": 2, "acuerdo con el bid": 2,
+    "fmi": 1, "credito": 1, "prestamo": 1, "estabilidad cambiaria": 2, "reservas suben": 2,
     "aumentan las reservas": 2, "exportaciones crecen": 1, "normaliza": 1, "calma": 1, "tranquilidad": 1,
-    "unificacion cambiaria": 2, "inversion": 1, "reactivacion": 1, "abastecimiento normal": 1,
+    "unificacion cambiaria": 2, "inversion": 1, "reactivacion": 1, "llegada de diesel": 1,
+    "abastecimiento normal": 1, "sube la calificacion": 2, "mejora la calificacion": 2,
+    "petroleo baja": 1, "petroleo cae": 1, "brent cae": 1, "brent baja": 1, "crudo cae": 1,
+    "fletes bajan": 1, "fletes caen": 1,
 }
 
 
@@ -327,46 +366,208 @@ def score_headline(title):
     return max(-3, min(3, up - down))
 
 
+def _rx(terms):
+    return re.compile(r"\b(?:" + "|".join(re.escape(t) for t in terms) + r")(?:s|es)?\b")
+
+
+R_BOLIVIA = _rx(["bolivia", "boliviano", "boliviana", "bcb", "banco central de bolivia", "ypfb", "asfi",
+                 "cochabamba", "el alto", "la paz", "tarija", "oruro", "potosi", "santa cruz de la sierra"])
+TOPICS = {  # nombre: (regex, puntos)
+    "fin": (_rx(["prestamo", "credito", "desembolso", "financiamiento", "bid", "caf", "fmi", "fondo monetario",
+                 "banco mundial", "bono", "eurobono", "deuda", "calificacion", "fitch", "moody", "s&p",
+                 "riesgo pais", "swap", "banco de desarrollo", "cooperacion", "donacion"]), 3),
+    "fuel": (_rx(["diesel", "gasolina", "combustible", "ypfb", "subvencion", "gas natural", "gnv", "glp",
+                  "surtidor", "hidrocarburo"]), 3),
+    "fx": (_rx(["tipo de cambio", "dolar", "paralelo", "usdt", "divisa", "reservas internacionales", "reserva",
+                "cambiario", "devaluacion", "cripto", "criptomoneda"]), 3),
+    "oil": (_rx(["petroleo", "brent", "wti", "opep", "crudo", "barril"]), 3),
+    "freight": (_rx(["flete", "contenedor", "naviera", "mar rojo", "canal de suez", "canal de panama", "ormuz",
+                     "hormuz", "puerto", "arica", "iquique", "antofagasta", "transporte maritimo", "buque"]), 3),
+    "trade": (_rx(["exportacion", "importacion", "balanza comercial", "gas", "litio", "soya", "oro", "remesa",
+                   "inversion extranjera", "mineria", "arancel"]), 2),
+    "macro": (_rx(["inflacion", "pib", "deficit", "presupuesto", "paro", "bloqueo", "huelga", "decreto",
+                   "ministro de economia", "ministerio de economia", "crisis", "escasez", "recesion",
+                   "politica monetaria", "tasa de interes", "fiscal"]), 2),
+}
+CAT_LABEL = {"fin": "Préstamos y financiamiento", "oil": "Petróleo", "freight": "Flete y puertos",
+             "fuel": "Combustibles", "fx": "Dólar y reservas", "trade": "Comercio exterior",
+             "macro": "Economía de Bolivia"}
+CAT_ORDER = ["fin", "oil", "freight", "fuel", "fx", "trade", "macro"]
+R_MAGNITUDE = re.compile(r"\d+(?:[.,]\d+)?\s?%|\b(?:dispar|desplom|hund|maximo|minimo|record|crisis|interrump|"
+                         r"bloque|ataque|cierre|colaps|recorte|escasez|salta|duplic|encarec|derrumb|sancion)\w*")
+R_STRONG = re.compile(r"\b(?:dispar|desplom|hund|record|colaps|ataque|interrump|cierre|bloque|derrumb|sancion|crisis)\w*")
+
+
+def strong_move(t):
+    """Movimiento grande: una palabra fuerte o un porcentaje de 3% o más."""
+    if R_STRONG.search(t):
+        return True
+    return any(float(p.replace(",", ".")) >= 3 for p in re.findall(r"(\d+(?:[.,]\d+)?)\s?%", t))
+
+
+R_NEG = _rx(["futbol", "gol", "clasico", "vence a", "campeonato", "torneo", "seleccion", "liga", "copa", "eliminatorias",
+             "clasifica", "jugador", "entrenador", "farandula", "horoscopo", "receta", "feminicidio", "asesinato",
+             "bolivar", "the strongest", "oriente petrolero", "wilstermann", "blooming", "always ready",
+             "puerto rico", "bitcoin", "ethereum", "memecoin"])
+R_FOREIGN = _rx(["argentina", "argentino", "venezuela", "venezolano", "peru", "peruano", "mexico", "mexicano",
+                 "colombia", "colombiano", "chile", "chileno", "ecuador", "brasil", "paraguay", "uruguay",
+                 "espana", "dolar blue", "peso argentino", "costa rica", "honduras", "guatemala", "cuba",
+                 "nicaragua", "el salvador"])
+GOOD_SRC = {"eldeber.com.bo", "reduno.com.bo", "unitel.bo", "lostiempos.com", "opinion.com.bo", "paginasiete.bo",
+            "brujuladigital.net", "vision360.bo", "erbol.com.bo", "urgente.bo", "eju.tv", "correodelsur.com",
+            "la-razon.com", "larazon.com", "ahoraelpueblo.bo", "abi.bo", "anf.com.bo", "bcb.gob.bo",
+            "reuters.com", "bloomberg.com", "bloomberglinea.com", "apnews.com", "efe.com", "bbc.com", "ft.com",
+            "wsj.com", "cnbc.com", "elpais.com", "swissinfo.ch", "dw.com", "france24.com", "americaeconomia.com",
+            "bnamericas.com", "infobae.com", "expansion.com", "lloydslist.com", "splash247.com",
+            "freightwaves.com", "tradewindsnews.com", "agenciaefe.com", "europapress.es"}
+JUNK_SRC = {"facebook.com", "youtube.com", "tiktok.com", "instagram.com", "x.com", "twitter.com", "medium.com",
+            "blogspot.com", "wordpress.com", "t.me", "telegram.org", "pinterest.com", "reddit.com"}
+STOP_TOKENS = set("para como pero sobre entre desde hasta este esta estos estas tras ante segun mas menos muy sus "
+                  "del las los una unos unas con por que son fue han ser hay ano anos dia dias nuevo nueva "
+                  "tras donde cuando esta estan sera podria podrian".split())
+
+
+def domain_of(url):
+    try:
+        d = urllib.parse.urlparse(url).netloc.lower()
+    except Exception:  # noqa: BLE001
+        return ""
+    return d[4:] if d.startswith("www.") else d
+
+
+def dom_in(dom, group):
+    return any(dom == g or dom.endswith("." + g) for g in group)
+
+
+def title_tokens(title):
+    return {w for w in re.findall(r"[a-z0-9]{4,}", norm(title)) if w not in STOP_TOKENS}
+
+
+def jaccard(a, b):
+    return len(a & b) / len(a | b) if a and b else 0.0
+
+
+def ago(iso_t, now=None):
+    mins = int(((now or now_utc()) - parse_iso(iso_t)).total_seconds() / 60)
+    return f"hace {mins} min" if mins < 90 else f"hace {mins // 60} h"
+
+
+def analyze_headline(title, dom, ncfg):
+    """Devuelve None si no sirve, o dict con puntaje de relevancia, categoría y dirección."""
+    t = norm(title)
+    if R_NEG.search(t):
+        return None
+    if dom_in(dom, JUNK_SRC):
+        return None
+    bolivia = bool(R_BOLIVIA.search(t))
+    topics = {k: pts for k, (rx, pts) in TOPICS.items() if rx.search(t)}
+    if not topics:
+        return None
+    good = dom_in(dom, GOOD_SRC)
+    magnitude = bool(R_MAGNITUDE.search(t))
+    if not bolivia:
+        # Noticia del exterior: solo petróleo o flete, con un movimiento claro y fuente seria
+        if not (("oil" in topics or "freight" in topics) and strong_move(t) and good):
+            return None
+        if "freight" in topics and "oil" not in topics and not re.search(r"flete|contenedor|naviera|mar rojo|canal|ormuz|hormuz", t):
+            return None  # "puerto"/"buque" sueltos no bastan
+    pts = min(6, sum(topics.values()))
+    score = pts + (4 if bolivia else 0) + (2 if magnitude else 0) + (2 if good else 0)
+    cat = next(c for c in CAT_ORDER if c in topics)
+    d = score_headline(title)
+    if abs(d) >= 2:
+        score += 1
+    return {"relevance": score, "cat": cat, "cat_label": CAT_LABEL[cat], "score": d, "bolivia": bolivia}
+
+
 def fetch_news(cfg, errors):
-    news_cfg = cfg["news"]
-    if not news_cfg.get("enabled"):
+    from concurrent.futures import ThreadPoolExecutor
+    ncfg = cfg["news"]
+    if not ncfg.get("enabled"):
         return []
-    seen, items = set(), []
-    cutoff = now_utc() - timedelta(hours=news_cfg["max_age_hours"])
-    ok = 0
-    for q in news_cfg["queries"]:
-        url = ("https://news.google.com/rss/search?q=" + urllib.parse.quote(q + " when:2d")
+    now = now_utc()
+    cutoff = now - timedelta(hours=ncfg["max_age_hours"])
+
+    def one(s):
+        url = ("https://news.google.com/rss/search?q=" + urllib.parse.quote(f"{s['q']} when:{s.get('when', '2d')}")
                + "&hl=es-419&gl=BO&ceid=BO:es-419")
         try:
-            root = ET.fromstring(http(url, timeout=15, retries=1))
-            ok += 1
+            return s, ET.fromstring(http(url, timeout=12, retries=1))
         except Exception as e:  # noqa: BLE001
-            errors.append(f"Noticias ({q[:25]}…): {e}")
+            return s, e
+
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        results = list(ex.map(one, ncfg["searches"]))
+    ok = 0
+    cands = []
+    for s, root in results:
+        if isinstance(root, Exception):
+            errors.append(f"Noticias ({s['q'][:28]}…): {root}")
             continue
+        ok += 1
         for it in root.iter("item"):
             title = (it.findtext("title") or "").strip()
-            key = re.sub(r"\W+", " ", norm(title.rsplit(" - ", 1)[0]))[:90]
-            if not title or key in seen:
+            src_el = it.find("source")
+            source = (src_el.text or "").strip() if src_el is not None else ""
+            dom = domain_of(src_el.get("url", "")) if src_el is not None else ""
+            if source and title.endswith(" - " + source):
+                title = title[: -len(source) - 3].strip()
+            if not title:
                 continue
             try:
                 dt = parsedate_to_datetime(it.findtext("pubDate"))
                 if dt.tzinfo is None:
                     dt = dt.replace(tzinfo=timezone.utc)
             except Exception:  # noqa: BLE001
-                dt = now_utc()
+                dt = now
             if dt < cutoff:
                 continue
-            seen.add(key)
-            src = (it.findtext("source") or "").strip()
-            sc = score_headline(title)
-            items.append({"title": title, "link": (it.findtext("link") or "").strip(), "source": src,
-                          "time": iso(dt), "score": sc,
-                          "impact": "alto" if abs(sc) >= 2 else ("medio" if abs(sc) == 1 else "bajo"),
-                          "direction": "sube" if sc > 0 else ("baja" if sc < 0 else "neutral")})
-    if news_cfg["queries"] and ok == 0:
+            a = analyze_headline(title, dom, ncfg)
+            if not a:
+                continue
+            cands.append({"title": title, "link": (it.findtext("link") or "").strip(), "source": source,
+                          "domain": dom, "time": iso(dt), "toks": title_tokens(title), **a})
+    if ncfg["searches"] and ok == 0:
         errors.append("Noticias: ninguna fuente respondió")
-    items.sort(key=lambda x: x["time"], reverse=True)
-    return items[:40]
+
+    # agrupar la misma noticia publicada por varios medios
+    cands.sort(key=lambda c: (c["relevance"], c["time"]), reverse=True)
+    groups = []
+    for c in cands:
+        for g in groups:
+            if jaccard(c["toks"], g["toks"]) >= 0.5:
+                g["members"].append(c)
+                g["toks"] |= c["toks"]
+                break
+        else:
+            groups.append({"toks": set(c["toks"]), "members": [c]})
+    items = []
+    for g in groups:
+        m = g["members"]
+        best = max(m, key=lambda c: (c["relevance"], c["time"]))
+        doms = {c["domain"] or c["source"] for c in m}
+        n_src = len(doms)
+        rel = best["relevance"] + min(3, n_src - 1)
+        if rel < ncfg["min_score"]:
+            continue
+        important = rel >= ncfg["important_score"]
+        sc = best["score"]
+        items.append({"title": best["title"], "link": best["link"], "source": best["source"], "time": best["time"],
+                      "cat": best["cat"], "cat_label": best["cat_label"], "score": sc, "relevance": rel,
+                      "n_sources": n_src, "important": important,
+                      "impact": "alto" if important else "medio",
+                      "direction": "sube" if sc > 0 else ("baja" if sc < 0 else "neutral"),
+                      "sig": sorted(best["toks"])[:14]})
+    items.sort(key=lambda x: (x["important"], x["relevance"], x["time"]), reverse=True)
+    return items[: ncfg["max_items"]]
+
+
+def news_line(n, now=None):
+    arrow = {"sube": "↑ sube USD", "baja": "↓ baja USD", "neutral": "• neutral"}[n["direction"]]
+    star = "⭐ " if n.get("important") else ""
+    multi = f" · {n['n_sources']} medios" if n.get("n_sources", 1) > 1 else ""
+    return (f"{star}[{n.get('cat_label', '')}] {arrow}\n{n['title']}\n"
+            f"{n.get('source', '')}{multi} · {ago(n['time'], now)}\n{n.get('link', '')}")
 
 
 # ───────────────────────── análisis técnico ─────────────────────────
@@ -523,7 +724,7 @@ def build_scenario(ta, news, pressure):
         "Más oferta que demanda de USDT en los libros" if pressure < -0.1 else "")
     if news:
         recent = [n for n in news if n["score"] != 0][:10]
-        s = sum(n["score"] for n in recent)
+        s = sum(n["score"] * (1.5 if n.get("important") else 1) for n in recent)
         v = clamp(s / 4)
         add("noticias", v, 20, ("Noticias con sesgo alcista para el dólar" if v > 0 else "Noticias con sesgo bajista para el dólar")
             if abs(v) > 0.05 else "")
@@ -600,10 +801,10 @@ class Alerter:
     def muted(self):
         return self.now.timestamp() < self.state.get("muted_until", 0)
 
-    def fire(self, key, kind, text):
+    def fire(self, key, kind, text, cd_min=None):
         if kind in self.state.get("auto_off", []) or self.muted():
             return False
-        cd = self.cfg["alerts"]["cooldown_min"].get(kind, 60) * 60
+        cd = (self.cfg["alerts"]["cooldown_min"].get(kind, 60) if cd_min is None else cd_min) * 60
         t = self.now.timestamp()
         if t - self.last.get(key, 0) < cd:
             return False
@@ -654,12 +855,21 @@ def evaluate_alerts(al, cfg, ta, scen, opps, news, platforms, price, prev_label)
     for s in build_signals(ta, scen, cfg):
         if s["type"] in ("compra", "venta"):
             al.fire(f"signal:{s['type']}", "signal", ("🟢 " if s["type"] == "compra" else "🔴 ") + s["text"])
+    # noticias: solo las clave, nuevas (últimas horas) y con efecto claro; una cada ~90 min como máximo
+    ncfg = cfg["news"]
+    sent = al.state.setdefault("news_sent", [])
     for n in news:
-        if abs(n["score"]) >= 2:
-            h = hashlib.md5(n["title"].encode()).hexdigest()[:10]
-            if al.fire(f"news:{h}", "news",
-                       f"📰 Noticia de impacto {n['direction'].upper()} para el dólar:\n{n['title']}\n{n['link']}"):
-                break  # máximo una noticia por ejecución
+        if not n.get("important") or n["direction"] == "neutral":
+            continue
+        if (al.now - parse_iso(n["time"])).total_seconds() > ncfg["alert_max_age_hours"] * 3600:
+            continue
+        sig = set(n.get("sig") or [])
+        if any(jaccard(sig, set(s["sig"])) >= 0.5 for s in sent):
+            continue
+        if al.fire("news:global", "news", "📰 Noticia clave\n" + news_line(n, al.now), cd_min=ncfg["alert_gap_min"]):
+            sent.append({"sig": sorted(sig), "t": int(al.now.timestamp())})
+            del sent[:-120]
+        break
 
 
 # ───────────────────────── Telegram ─────────────────────────
@@ -740,9 +950,12 @@ def make_report(kind, latest):
     if kind in ("full", "news"):
         if kind == "full":
             lines.append("")
-        lines.append("📰 Noticias recientes:")
-        for n in latest["news"][:6]:
-            lines.append(f"  [{n['direction']}] {n['title']}")
+        lines.append("📰 Noticias clave (Bolivia, préstamos, petróleo y flete):")
+        top = latest["news"][: (3 if kind == "full" else 6)]
+        if not top:
+            lines.append("  Sin noticias importantes por ahora.")
+        for i, n in enumerate(top, 1):
+            lines.append(f"{i}) " + news_line(n))
     if kind == "full":
         lines.append("\nNo es asesoría financiera.")
     return "\n".join(lines)
@@ -1370,14 +1583,14 @@ def demo_data(cfg, hist_len_h=340):
     for name, off in (("binance", 0.0), ("bybit", 0.004)):
         b, s = demo_ads(p * (1 + off), rnd)
         pl[name] = summarize(b, s, cfg, name)
-    news = [
-        {"title": "Demo: Gobierno anuncia desembolso de crédito externo para reforzar reservas", "link": "#",
-         "source": "Demo", "time": iso(now - timedelta(hours=3)), "score": 2, "impact": "alto", "direction": "baja"},
-        {"title": "Demo: Persisten bloqueos y escasez de dólares en el mercado", "link": "#",
-         "source": "Demo", "time": iso(now - timedelta(hours=5)), "score": 3, "impact": "alto", "direction": "sube"},
-        {"title": "Demo: Banco Central informa sobre tipo de cambio oficial", "link": "#",
-         "source": "Demo", "time": iso(now - timedelta(hours=9)), "score": 0, "impact": "bajo", "direction": "neutral"},
-    ]
+    mk = lambda t, h, sc, cat, lab, imp: {  # noqa: E731
+        "title": t, "link": "https://example.com", "source": "Demo", "time": iso(now - timedelta(hours=h)),
+        "score": sc, "cat": cat, "cat_label": lab, "relevance": 12 if imp else 8, "n_sources": 2 if imp else 1,
+        "important": imp, "impact": "alto" if imp else "medio",
+        "direction": "sube" if sc > 0 else ("baja" if sc < 0 else "neutral"), "sig": t.lower().split()[:8]}
+    news = [mk("Demo: BID aprueba préstamo para Bolivia", 3, -2, "fin", CAT_LABEL["fin"], True),
+            mk("Demo: Persisten bloqueos y escasez de dólares en Bolivia", 5, 3, "fx", CAT_LABEL["fx"], True),
+            mk("Demo: Fletes de contenedores suben 20% por el Mar Rojo", 9, 2, "freight", CAT_LABEL["freight"], False)]
     return pl, news, hist
 
 
