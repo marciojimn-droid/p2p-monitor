@@ -2,8 +2,8 @@ name: Monitor P2P USDT-BOB
 
 on:
   schedule:
-    - cron: "*/5 * * * *"
-  workflow_dispatch:
+    - cron: "*/5 * * * *"   # cada 5 minutos (GitHub puede demorar algunos minutos en horas de mucha carga)
+  workflow_dispatch:          # permite ejecutarlo a mano desde la pestaña Actions
 
 permissions:
   contents: write
@@ -15,7 +15,7 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 4
+    timeout-minutes: 8
     steps:
       - uses: actions/checkout@v4
 
@@ -23,6 +23,8 @@ jobs:
         with:
           python-version: "3.12"
 
+      # El historial y el estado viven en una rama aparte ("data") que se reescribe en cada
+      # ejecución con un solo commit, así el repositorio no crece con miles de commits.
       - name: Traer datos previos
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -32,14 +34,19 @@ jobs:
             || mkdir -p datadir
           rm -rf datadir/.git
 
+      # Cada ejecución dura ~4 min: revisa precios y se queda escuchando Telegram para
+      # responder a tus botones casi al instante y vigilar tus alertas cada minuto.
       - name: Ejecutar monitor
+        timeout-minutes: 5
         env:
+          LIVE_SECONDS: "225"
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           WAVESOFT_TOKEN: ${{ secrets.WAVESOFT_TOKEN }}
         run: python monitor.py --data datadir
 
       - name: Publicar datos
+        if: always()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
