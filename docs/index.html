@@ -310,13 +310,16 @@ function calc(d) {
 }
 
 function news(d) {
-  const kids = [el("h2", {text: "Noticias que pueden mover el tipo de cambio"})];
-  if (!d.news.length) kids.push(el("div", {class: "empty", text: "Sin noticias recientes."}));
-  d.news.slice(0, 10).forEach(n => {
-    const a = el("a", {href: n.link, target: "_blank", rel: "noopener"}, el("span", {class: "tag " + n.direction, text: n.direction === "sube" ? "↑ sube USD" : n.direction === "baja" ? "↓ baja USD" : "neutral"}), n.title.replace(/ - [^-]+$/, ""));
-    kids.push(el("div", {class: "it"}, a, el("div", {class: "meta", text: `${n.source || ""} · ${fmtTime(n.time)} · impacto ${n.impact}`})));
+  const kids = [el("h2", {text: "Noticias clave: Bolivia, préstamos, petróleo y flete"})];
+  if (!d.news.length) kids.push(el("div", {class: "empty", text: "Sin noticias importantes por ahora."}));
+  d.news.slice(0, 8).forEach(n => {
+    const dirTxt = n.direction === "sube" ? "↑ sube USD" : n.direction === "baja" ? "↓ baja USD" : "neutral";
+    const a = el("a", {href: n.link, target: "_blank", rel: "noopener"},
+      el("span", {class: "tag " + n.direction, text: dirTxt}), (n.important ? "⭐ " : "") + n.title);
+    const meta = `${n.cat_label || ""} · ${n.source || ""}${n.n_sources > 1 ? " +" + (n.n_sources - 1) + " medios" : ""} · ${fmtTime(n.time)}`;
+    kids.push(el("div", {class: "it"}, a, el("div", {class: "meta", text: meta})));
   });
-  kids.push(el("div", {class: "sub", style: "margin-top:8px", text: "La etiqueta sale de palabras clave del titular: es orientativa, no una lectura completa de la noticia."}));
+  kids.push(el("div", {class: "sub", style: "margin-top:8px", text: "Solo se muestran noticias relevantes para el tipo de cambio en Bolivia. La flecha sale de palabras clave del titular: es orientativa."}));
   $("news").replaceChildren(...kids);
 }
 
