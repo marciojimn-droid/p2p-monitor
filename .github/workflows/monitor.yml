@@ -15,7 +15,7 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 11
     steps:
       - uses: actions/checkout@v4
 
@@ -34,12 +34,13 @@ jobs:
             || mkdir -p datadir
           rm -rf datadir/.git
 
-      # Cada ejecución dura ~4 min: revisa precios y se queda escuchando Telegram para
+      # Cada ejecución dura ~8 min (más que el cron de 5 min, así siempre hay otra en cola esperando y el bot no queda sin escuchar)
+      # ~4 min: revisa precios y se queda escuchando Telegram para
       # responder a tus botones casi al instante y vigilar tus alertas cada minuto.
       - name: Ejecutar monitor
-        timeout-minutes: 5
+        timeout-minutes: 9
         env:
-          LIVE_SECONDS: "225"
+          LIVE_SECONDS: "420"
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           WAVESOFT_TOKEN: ${{ secrets.WAVESOFT_TOKEN }}
