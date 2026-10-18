@@ -18,6 +18,7 @@ Uso:
 """
 import argparse
 import hashlib
+import html as htmllib
 import json
 import math
 import os
@@ -65,9 +66,22 @@ DEFAULTS = {
                          "signal": 120, "level": 120, "news": 360, "rule": 0},
     },
     "news": {
-        "enabled": True, "max_age_hours": 72, "max_items": 8, "min_score": 7, "important_score": 10,
-        "alert_max_age_hours": 6, "alert_gap_min": 90,
+        "enabled": True, "max_age_hours": 72, "max_items": 6, "min_score": 7, "important_score": 11,
+        "alert_max_age_hours": 6, "alert_gap_min": 90, "max_article_fetches": 10,
+        # secciones de economía que se leen directamente (prioridad máxima)
+        "sections": [
+            {"name": "El Deber · Economía", "url": "https://eldeber.com.bo/economia", "domain": "eldeber.com.bo",
+             "base": "https://eldeber.com.bo", "link_re": r"((?:https://eldeber\.com\.bo)?/(?:economia|dinero)/[a-z0-9\-]+_\d{9,12})(?=[\"'\s<?#)])"},
+            {"name": "Red Uno · Economía", "url": "https://www.reduno.com.bo/economia", "domain": "reduno.com.bo",
+             "base": "https://www.reduno.com.bo", "link_re": r"((?:https://www\.reduno\.com\.bo)?/economia/[a-z0-9\-]+-\d{12,14})(?=[\"'\s<?#)])"},
+            {"name": "Unitel · Economía", "url": "https://unitel.bo/noticias/economia", "domain": "unitel.bo",
+             "base": "https://unitel.bo", "link_re": r"((?:https://unitel\.bo)?/noticias/economia/[a-z0-9\-]+-[A-Z]{2}\d{6,10})(?=[\"'\s<?#)])"},
+        ],
+        # búsquedas complementarias (Google Noticias): UIF, ASFI, P2P, préstamos, petróleo, flete, etc.
         "searches": [
+            {"q": "Bolivia UIF Unidad de Investigaciones Financieras", "when": "7d"},
+            {"q": "Bolivia ASFI criptoactivos criptomonedas regulación", "when": "7d"},
+            {"q": "Bolivia P2P USDT dólar cripto cuentas bancarias", "when": "7d"},
             {"q": 'Bolivia "tipo de cambio" dólar paralelo', "when": "2d"},
             {"q": 'Bolivia dólares reservas "Banco Central de Bolivia"', "when": "2d"},
             {"q": "Bolivia escasez de dólares divisas", "when": "2d"},
@@ -82,7 +96,6 @@ DEFAULTS = {
             {"q": "puertos Arica Iquique carga boliviana", "when": "3d"},
             {"q": "Bolivia bloqueos paro economía pérdidas", "when": "2d"},
             {"q": "Bolivia inflación PIB déficit fiscal", "when": "3d"},
-            {"q": "Bolivia exportaciones gas litio soya remesas", "when": "3d"},
             {"q": "site:eldeber.com.bo economía dólar", "when": "2d"},
             {"q": "site:reduno.com.bo economía dólar", "when": "2d"},
             {"q": "site:unitel.bo economía dólar", "when": "2d"},
@@ -376,25 +389,31 @@ TOPICS = {  # nombre: (regex, puntos)
     "fin": (_rx(["prestamo", "credito", "desembolso", "financiamiento", "bid", "caf", "fmi", "fondo monetario",
                  "banco mundial", "bono", "eurobono", "deuda", "calificacion", "fitch", "moody", "s&p",
                  "riesgo pais", "swap", "banco de desarrollo", "cooperacion", "donacion"]), 3),
+    "reg": (_rx(["uif", "unidad de investigaciones financieras", "asfi", "gafi", "lavado de dinero",
+                 "lavado de activos", "legitimacion de ganancias", "criptoactivo", "activo virtual",
+                 "criptomoneda", "cripto", "p2p", "usdt", "tether", "stablecoin", "exchange", "binance", "bybit",
+                 "congelamiento de cuentas", "cuentas congeladas", "registro de exchanges"]), 5),
     "fuel": (_rx(["diesel", "gasolina", "combustible", "ypfb", "subvencion", "gas natural", "gnv", "glp",
-                  "surtidor", "hidrocarburo"]), 3),
+                  "surtidor", "hidrocarburo"]), 2),
     "fx": (_rx(["tipo de cambio", "dolar", "paralelo", "usdt", "divisa", "reservas internacionales", "reserva",
                 "cambiario", "devaluacion", "cripto", "criptomoneda"]), 3),
     "oil": (_rx(["petroleo", "brent", "wti", "opep", "crudo", "barril"]), 3),
     "freight": (_rx(["flete", "contenedor", "naviera", "mar rojo", "canal de suez", "canal de panama", "ormuz",
-                     "hormuz", "puerto", "arica", "iquique", "antofagasta", "transporte maritimo", "buque"]), 3),
+                     "hormuz", "puerto", "arica", "iquique", "antofagasta", "transporte maritimo", "buque",
+                     "libre transito"]), 3),
     "trade": (_rx(["exportacion", "importacion", "balanza comercial", "gas", "litio", "soya", "oro", "remesa",
                    "inversion extranjera", "mineria", "arancel"]), 2),
     "macro": (_rx(["inflacion", "pib", "deficit", "presupuesto", "paro", "bloqueo", "huelga", "decreto",
-                   "ministro de economia", "ministerio de economia", "crisis", "escasez", "recesion",
+                   "ministro de economia", "ministerio de economia", "crisis", "escasez", "recesion", "movilizacion",
+                   "estado de excepcion", "marcha",
                    "politica monetaria", "tasa de interes", "fiscal"]), 2),
 }
-CAT_LABEL = {"fin": "Préstamos y financiamiento", "oil": "Petróleo", "freight": "Flete y puertos",
+CAT_LABEL = {"reg": "UIF, ASFI y P2P", "fin": "Préstamos y financiamiento", "oil": "Petróleo", "freight": "Flete y puertos",
              "fuel": "Combustibles", "fx": "Dólar y reservas", "trade": "Comercio exterior",
              "macro": "Economía de Bolivia"}
-CAT_ORDER = ["fin", "oil", "freight", "fuel", "fx", "trade", "macro"]
+CAT_ORDER = ["reg", "fin", "oil", "freight", "fuel", "fx", "trade", "macro"]
 R_MAGNITUDE = re.compile(r"\d+(?:[.,]\d+)?\s?%|\b(?:dispar|desplom|hund|maximo|minimo|record|crisis|interrump|"
-                         r"bloque|ataque|cierre|colaps|recorte|escasez|salta|duplic|encarec|derrumb|sancion)\w*")
+                         r"ataque|cierre|colaps|recorte|escasez|salta|duplic|encarec|derrumb|sancion)\w*")
 R_STRONG = re.compile(r"\b(?:dispar|desplom|hund|record|colaps|ataque|interrump|cierre|bloque|derrumb|sancion|crisis)\w*")
 
 
@@ -408,7 +427,10 @@ def strong_move(t):
 R_NEG = _rx(["futbol", "gol", "clasico", "vence a", "campeonato", "torneo", "seleccion", "liga", "copa", "eliminatorias",
              "clasifica", "jugador", "entrenador", "farandula", "horoscopo", "receta", "feminicidio", "asesinato",
              "bolivar", "the strongest", "oriente petrolero", "wilstermann", "blooming", "always ready",
-             "puerto rico", "bitcoin", "ethereum", "memecoin"])
+             "puerto rico"])
+R_NEG_FOREIGN = _rx(["bitcoin", "ethereum", "memecoin", "dogecoin", "solana"])  # cripto genérica: solo si es de Bolivia
+R_ROUTINE = re.compile(r"asi se cotiza|a cuanto se cotiza|asi estara el dolar|como estara el dolar|dolar hoy|"
+                       r"necesita cambiar dolares|cotizaciones? (?:para|de) (?:este|hoy)|cotizacion del dolar (?:hoy|este)")
 R_FOREIGN = _rx(["argentina", "argentino", "venezuela", "venezolano", "peru", "peruano", "mexico", "mexicano",
                  "colombia", "colombiano", "chile", "chileno", "ecuador", "brasil", "paraguay", "uruguay",
                  "espana", "dolar blue", "peso argentino", "costa rica", "honduras", "guatemala", "cuba",
@@ -419,7 +441,13 @@ GOOD_SRC = {"eldeber.com.bo", "reduno.com.bo", "unitel.bo", "lostiempos.com", "o
             "reuters.com", "bloomberg.com", "bloomberglinea.com", "apnews.com", "efe.com", "bbc.com", "ft.com",
             "wsj.com", "cnbc.com", "elpais.com", "swissinfo.ch", "dw.com", "france24.com", "americaeconomia.com",
             "bnamericas.com", "infobae.com", "expansion.com", "lloydslist.com", "splash247.com",
-            "freightwaves.com", "tradewindsnews.com", "agenciaefe.com", "europapress.es"}
+            "freightwaves.com", "tradewindsnews.com", "agenciaefe.com", "europapress.es", "asfi.gob.bo",
+            "uif.gob.bo", "criptonoticias.com"}
+PRIORITY_SRC = {"eldeber.com.bo", "reduno.com.bo", "unitel.bo"}  # secciones de economía que sigues
+BOLIVIAN_SRC = {"eldeber.com.bo", "reduno.com.bo", "unitel.bo", "lostiempos.com", "opinion.com.bo",
+                "paginasiete.bo", "brujuladigital.net", "vision360.bo", "erbol.com.bo", "urgente.bo", "eju.tv",
+                "correodelsur.com", "la-razon.com", "larazon.com", "ahoraelpueblo.bo", "abi.bo", "anf.com.bo",
+                "bcb.gob.bo", "asfi.gob.bo", "uif.gob.bo"}
 JUNK_SRC = {"facebook.com", "youtube.com", "tiktok.com", "instagram.com", "x.com", "twitter.com", "medium.com",
             "blogspot.com", "wordpress.com", "t.me", "telegram.org", "pinterest.com", "reddit.com"}
 STOP_TOKENS = set("para como pero sobre entre desde hasta este esta estos estas tras ante segun mas menos muy sus "
@@ -455,24 +483,28 @@ def ago(iso_t, now=None):
 def analyze_headline(title, dom, ncfg):
     """Devuelve None si no sirve, o dict con puntaje de relevancia, categoría y dirección."""
     t = norm(title)
-    if R_NEG.search(t):
+    if R_NEG.search(t) or R_ROUTINE.search(t) or dom_in(dom, JUNK_SRC):
         return None
-    if dom_in(dom, JUNK_SRC):
+    bol_text = bool(R_BOLIVIA.search(t))
+    bolivia = bol_text or dom_in(dom, BOLIVIAN_SRC)  # un medio boliviano ya implica Bolivia
+    if not bolivia and R_NEG_FOREIGN.search(t):
         return None
-    bolivia = bool(R_BOLIVIA.search(t))
     topics = {k: pts for k, (rx, pts) in TOPICS.items() if rx.search(t)}
     if not topics:
         return None
-    good = dom_in(dom, GOOD_SRC)
+    if R_FOREIGN.search(t) and not bol_text and not ("oil" in topics or "freight" in topics):
+        return None  # habla de otro país sin mencionar Bolivia
+    good, prio = dom_in(dom, GOOD_SRC), dom_in(dom, PRIORITY_SRC)
     magnitude = bool(R_MAGNITUDE.search(t))
     if not bolivia:
         # Noticia del exterior: solo petróleo o flete, con un movimiento claro y fuente seria
         if not (("oil" in topics or "freight" in topics) and strong_move(t) and good):
             return None
-        if "freight" in topics and "oil" not in topics and not re.search(r"flete|contenedor|naviera|mar rojo|canal|ormuz|hormuz", t):
+        if "freight" in topics and "oil" not in topics and not re.search(
+                r"flete|contenedor|naviera|mar rojo|canal|ormuz|hormuz", t):
             return None  # "puerto"/"buque" sueltos no bastan
     pts = min(6, sum(topics.values()))
-    score = pts + (4 if bolivia else 0) + (2 if magnitude else 0) + (2 if good else 0)
+    score = pts + (4 if bolivia else 0) + (2 if magnitude else 0) + (3 if prio else 2 if good else 0)
     cat = next(c for c in CAT_ORDER if c in topics)
     d = score_headline(title)
     if abs(d) >= 2:
@@ -480,7 +512,142 @@ def analyze_headline(title, dom, ncfg):
     return {"relevance": score, "cat": cat, "cat_label": CAT_LABEL[cat], "score": d, "bolivia": bolivia}
 
 
-def fetch_news(cfg, errors):
+# ── secciones de economía de El Deber, Red Uno y Unitel (lectura directa de la página) ──
+
+def slug_text(url):
+    slug = url.rstrip("/").rsplit("/", 1)[-1]
+    slug = re.sub(r"[_-](?:[A-Z]{2})?\d{6,}$", "", slug)  # quita el código/fecha final
+    return slug.replace("-", " ").replace("_", " ")
+
+
+def time_from_url(url):
+    m = re.search(r"_(\d{10})$", url)  # El Deber: el número final es la hora de publicación (unix)
+    if m:
+        v = int(m.group(1))
+        if 1.5e9 < v < 4.1e9:
+            return datetime.fromtimestamp(v, timezone.utc)
+    m = re.search(r"-(\d{12,14})$", url)  # Red Uno: AAAAMMDDhhmmss (hora de Bolivia)
+    if m:
+        d = m.group(1)
+        try:
+            ymd, rest = d[:8], d[8:].rjust(6, "0")
+            return datetime.strptime(ymd + rest, "%Y%m%d%H%M%S").replace(tzinfo=LPZ).astimezone(timezone.utc)
+        except ValueError:
+            return None
+    return None
+
+
+def meta_content(page, prop):
+    for pat in (r'<meta[^>]+(?:property|name)=["\']' + prop + r'["\'][^>]*content=["\']([^"\']*)["\']',
+                r'<meta[^>]+content=["\']([^"\']*)["\'][^>]*(?:property|name)=["\']' + prop + r'["\']'):
+        m = re.search(pat, page, re.I)
+        if m:
+            return htmllib.unescape(m.group(1)).strip()
+    return None
+
+
+def parse_article(page):
+    title = meta_content(page, "og:title")
+    if not title:
+        m = re.search(r"<title[^>]*>(.*?)</title>", page, re.I | re.S)
+        title = htmllib.unescape(m.group(1)).strip() if m else None
+    if title:
+        title = re.sub(r"\s*[|\-–—]\s*(?:El Deber|Red Uno|RedUno|Unitel)[^|]*$", "", title, flags=re.I).strip()
+    ts = meta_content(page, "article:published_time") or meta_content(page, "og:article:published_time")
+    if not ts:
+        m = re.search(r'"datePublished"\s*:\s*"([^"]+)"', page)
+        ts = m.group(1) if m else None
+    dt = None
+    if ts:
+        try:
+            dt = datetime.fromisoformat(ts.strip().replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=LPZ)
+            dt = dt.astimezone(timezone.utc)
+        except ValueError:
+            dt = None
+    return title, dt
+
+
+def extract_links(page, sec):
+    page = page.replace("\\/", "/")
+    out, seen = [], set()
+    for m in re.finditer(sec["link_re"], page):
+        path = m.group(1)
+        url = path if path.startswith("http") else sec["base"] + path
+        if url in seen:
+            continue
+        seen.add(url)
+        atitle = None
+        a = re.search(r'<a[^>]+href=["\'][^"\']*' + re.escape(path) + r'["\'][^>]*>(.*?)</a>', page, re.S | re.I)
+        if a:
+            txt = re.sub(r"\s+", " ", htmllib.unescape(re.sub(r"<[^>]+>", " ", a.group(1)))).strip()
+            if len(txt) >= 25:
+                atitle = txt
+        out.append((url, atitle))
+    return out
+
+
+def fetch_sections(ncfg, errors, cache, now, cutoff):
+    from concurrent.futures import ThreadPoolExecutor
+    secs = ncfg.get("sections") or []
+    if not secs:
+        return []
+
+    def get(url, timeout=12):
+        try:
+            return http(url, timeout=timeout, retries=1 if timeout > 10 else 0).decode("utf-8", "ignore")
+        except Exception as e:  # noqa: BLE001
+            return e
+
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        pages = list(ex.map(lambda s: get(s["url"]), secs))
+    pending, cands = [], []
+    for sec, page in zip(secs, pages):
+        if isinstance(page, Exception):
+            errors.append(f"{sec['name']}: no se pudo leer la sección ({page})")
+            continue
+        links = extract_links(page, sec)
+        if not links:
+            errors.append(f"{sec['name']}: la página cambió y no encontré noticias (avísame para ajustarlo)")
+        for url, atitle in links[:40]:
+            if not analyze_headline(slug_text(url), sec["domain"], ncfg):
+                continue  # primer filtro con el texto del enlace
+            pending.append((sec, url, atitle))
+    # título y hora reales: de la caché o abriendo la noticia (máx. N por ejecución)
+    need = []
+    for sec, url, atitle in pending:
+        c = cache.get(url)
+        if c and c.get("title") and c.get("time"):
+            continue
+        need.append((sec, url, atitle))
+    need = need[: ncfg.get("max_article_fetches", 10)]
+    with ThreadPoolExecutor(max_workers=5) as ex:
+        arts = list(ex.map(lambda x: get(x[1], timeout=10), need))
+    for (sec, url, atitle), page in zip(need, arts):
+        title, dt = (None, None) if isinstance(page, Exception) else parse_article(page)
+        dt = dt or time_from_url(url)
+        cache[url] = {"title": title or atitle or slug_text(url), "time": iso(dt) if dt else None,
+                      "seen": iso(now)}
+    for sec, url, atitle in pending:
+        c = cache.get(url)
+        if not c:
+            continue
+        dt = parse_iso(c["time"]) if c.get("time") else (time_from_url(url) or now - timedelta(hours=12))
+        if dt < cutoff:
+            continue
+        a = analyze_headline(c["title"], sec["domain"], ncfg)
+        if not a:
+            continue
+        cands.append({"title": c["title"], "link": url, "source": sec["name"], "domain": sec["domain"],
+                      "time": iso(dt), "toks": title_tokens(c["title"]), **a})
+    if len(cache) > 300:
+        for k in sorted(cache, key=lambda k: cache[k].get("seen", ""))[: len(cache) - 300]:
+            del cache[k]
+    return cands
+
+
+def fetch_news(cfg, errors, cache=None):
     from concurrent.futures import ThreadPoolExecutor
     ncfg = cfg["news"]
     if not ncfg.get("enabled"):
@@ -500,6 +667,11 @@ def fetch_news(cfg, errors):
         results = list(ex.map(one, ncfg["searches"]))
     ok = 0
     cands = []
+    try:
+        cands += fetch_sections(ncfg, errors, cache if cache is not None else {}, now, cutoff)
+    except Exception as e:  # noqa: BLE001
+        errors.append(f"Secciones de economía: {e}")
+    n_direct = len(cands)
     for s, root in results:
         if isinstance(root, Exception):
             errors.append(f"Noticias ({s['q'][:28]}…): {root}")
@@ -527,7 +699,7 @@ def fetch_news(cfg, errors):
                 continue
             cands.append({"title": title, "link": (it.findtext("link") or "").strip(), "source": source,
                           "domain": dom, "time": iso(dt), "toks": title_tokens(title), **a})
-    if ncfg["searches"] and ok == 0:
+    if ncfg["searches"] and ok == 0 and n_direct == 0:
         errors.append("Noticias: ninguna fuente respondió")
 
     # agrupar la misma noticia publicada por varios medios
@@ -859,7 +1031,7 @@ def evaluate_alerts(al, cfg, ta, scen, opps, news, platforms, price, prev_label)
     ncfg = cfg["news"]
     sent = al.state.setdefault("news_sent", [])
     for n in news:
-        if not n.get("important") or n["direction"] == "neutral":
+        if not n.get("important") or (n["direction"] == "neutral" and n.get("cat") != "reg"):
             continue
         if (al.now - parse_iso(n["time"])).total_seconds() > ncfg["alert_max_age_hours"] * 3600:
             continue
@@ -1664,7 +1836,7 @@ def main():
         platforms, news, hist = demo_data(cfg)
     else:
         platforms, used_wavesoft = get_platforms(cfg, errors, ws_token)
-        news = fetch_news(cfg, errors)
+        news = fetch_news(cfg, errors, state.setdefault("news_cache", {}))
         if ws_token and not state.get("seeded"):
             seed = wavesoft_seed(ws_token, errors)
             if seed:
