@@ -10,14 +10,16 @@
   "min_finish_rate": 0.9,
   "maker_rank": 3,
   "history_max": 4000,
+  "live_seconds": 420,
+  "live_refresh_seconds": 60,
   "alerts": {
-    "move_pct_30m": 0.3,
-    "move_pct_2h": 0.6,
+    "move_pct_30m": 0.5,
+    "move_pct_2h": 0.9,
     "arb_net_pct": 0.3,
     "maker_net_pct": 0.3,
     "taker_net_pct": 0.2,
-    "price_above": 12.00,
-    "price_below": 11.60,
+    "price_above": null,
+    "price_below": null,
     "rsi_overbought": 70,
     "rsi_oversold": 30,
     "cooldown_min": {
@@ -27,20 +29,126 @@
       "taker": 30,
       "signal": 120,
       "level": 120,
-      "news": 360
+      "news": 360,
+      "rule": 0
     }
   },
   "news": {
     "enabled": true,
-    "max_age_hours": 48,
-    "queries": [
-      "dólar paralelo Bolivia",
-      "tipo de cambio Bolivia dólar",
-      "Banco Central de Bolivia reservas dólares",
-      "Bolivia escasez de dólares combustible",
-      "site:eldeber.com.bo economía dólar",
-      "site:reduno.com.bo economía dólar",
-      "site:unitel.bo economía dólar"
+    "max_age_hours": 72,
+    "max_items": 6,
+    "min_score": 7,
+    "important_score": 11,
+    "alert_max_age_hours": 6,
+    "alert_gap_min": 90,
+    "max_article_fetches": 10,
+    "sections": [
+      {
+        "name": "El Deber · Economía",
+        "url": "https://eldeber.com.bo/economia",
+        "domain": "eldeber.com.bo",
+        "base": "https://eldeber.com.bo",
+        "link_re": "((?:https://eldeber\\.com\\.bo)?/(?:economia|dinero)/[a-z0-9\\-]+_\\d{9,12})(?=[\\\"'\\s<?#)])"
+      },
+      {
+        "name": "Red Uno · Economía",
+        "url": "https://www.reduno.com.bo/economia",
+        "domain": "reduno.com.bo",
+        "base": "https://www.reduno.com.bo",
+        "link_re": "((?:https://www\\.reduno\\.com\\.bo)?/economia/[a-z0-9\\-]+-\\d{12,14})(?=[\\\"'\\s<?#)])"
+      },
+      {
+        "name": "Unitel · Economía",
+        "url": "https://unitel.bo/noticias/economia",
+        "domain": "unitel.bo",
+        "base": "https://unitel.bo",
+        "link_re": "((?:https://unitel\\.bo)?/noticias/economia/[a-z0-9\\-]+-[A-Z]{2}\\d{6,10})(?=[\\\"'\\s<?#)])"
+      }
+    ],
+    "searches": [
+      {
+        "q": "Bolivia UIF Unidad de Investigaciones Financieras",
+        "when": "7d"
+      },
+      {
+        "q": "Bolivia ASFI criptoactivos criptomonedas regulación",
+        "when": "7d"
+      },
+      {
+        "q": "Bolivia P2P USDT dólar cripto cuentas bancarias",
+        "when": "7d"
+      },
+      {
+        "q": "Bolivia \"tipo de cambio\" dólar paralelo",
+        "when": "2d"
+      },
+      {
+        "q": "Bolivia dólares reservas \"Banco Central de Bolivia\"",
+        "when": "2d"
+      },
+      {
+        "q": "Bolivia escasez de dólares divisas",
+        "when": "2d"
+      },
+      {
+        "q": "Bolivia préstamo BID OR CAF OR \"Banco Mundial\" OR FMI desembolso",
+        "when": "7d"
+      },
+      {
+        "q": "Bolivia financiamiento externo crédito aprobado",
+        "when": "7d"
+      },
+      {
+        "q": "Bolivia bonos deuda calificación Fitch OR Moody's",
+        "when": "7d"
+      },
+      {
+        "q": "Bolivia diésel gasolina YPFB importación combustible",
+        "when": "2d"
+      },
+      {
+        "q": "Bolivia subvención combustibles decreto",
+        "when": "3d"
+      },
+      {
+        "q": "precio del petróleo Brent OPEP",
+        "when": "1d"
+      },
+      {
+        "q": "flete marítimo contenedores navieras",
+        "when": "2d"
+      },
+      {
+        "q": "Mar Rojo OR \"Canal de Suez\" OR \"Canal de Panamá\" OR Ormuz navieras",
+        "when": "2d"
+      },
+      {
+        "q": "puertos Arica Iquique carga boliviana",
+        "when": "3d"
+      },
+      {
+        "q": "Bolivia bloqueos paro economía pérdidas",
+        "when": "2d"
+      },
+      {
+        "q": "Bolivia inflación PIB déficit fiscal",
+        "when": "3d"
+      },
+      {
+        "q": "site:eldeber.com.bo economía dólar",
+        "when": "2d"
+      },
+      {
+        "q": "site:reduno.com.bo economía dólar",
+        "when": "2d"
+      },
+      {
+        "q": "site:unitel.bo economía dólar",
+        "when": "2d"
+      }
     ]
-  }
+  },
+  "exact_mode": true,
+  "min_usdt_available": 30,
+  "max_order_usdt_trivial": 9
 }

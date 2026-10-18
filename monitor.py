@@ -48,9 +48,12 @@ DEFAULTS = {
     "transfer_size_usdt": 300,
     "min_monthly_orders": 30,
     "min_finish_rate": 0.9,
+    "exact_mode": True,
+    "min_usdt_available": 30,
+    "max_order_usdt_trivial": 9,
     "maker_rank": 3,
     "history_max": 4000,
-    "live_seconds": 120,
+    "live_seconds": 420,
     "live_refresh_seconds": 60,
     "alerts": {
         "move_pct_30m": 0.5,
@@ -190,6 +193,11 @@ def write_json(path, obj):
 
 # ───────────────────────── fuentes P2P ─────────────────────────
 
+def px(v, plat=None):
+    """Precio como lo muestra cada app: Bybit con 3 decimales, Binance con 2."""
+    return f"{v:.3f}" if plat == "bybit" else f"{v:.2f}"
+
+
 def slim(a):
     return {"price": a["price"], "available": round(a["available"], 2), "min": a["min"], "max": a["max"],
             "merchant": a.get("merchant"), "orders": a.get("orders"), "rate": a.get("rate")}
@@ -234,7 +242,20 @@ def bybit_ads(side, rows=20):
     return ads
 
 
+def exact_filter(ads, cfg):
+    """Modo exacto: el #1 del libro tal como lo ves en la app. Solo se descartan los anuncios de
+    juguete: con menos de `min_usdt_available` USDT, o cuyo límite máximo por orden (en Bs) equivale
+    a `max_order_usdt_trivial` USDT o menos (rangos de 1 a 9 USDT)."""
+    m = cfg.get("min_usdt_available") or 0
+    triv = cfg.get("max_order_usdt_trivial") or 0
+    return [a for a in ads
+            if (a.get("available") or 0) >= m
+            and (a.get("max") or 0) > triv * a["price"]]
+
+
 def quality_filter(ads, amount, cfg):
+    if cfg.get("exact_mode"):
+        return exact_filter(ads, cfg)
     q = [a for a in ads
          if (a.get("orders") is None or a["orders"] >= cfg["min_monthly_orders"])
          and (a.get("rate") is None or a["rate"] >= cfg["min_finish_rate"])]
@@ -250,6 +271,9 @@ def summarize(buy_ads, sell_ads, cfg, name, source=None):
     amount = cfg["trade_amount_bob"]
     buy = sorted(quality_filter(buy_ads, amount, cfg), key=lambda a: a["price"])
     sell = sorted(quality_filter(sell_ads, amount, cfg), key=lambda a: -a["price"])
+    if not buy or not sell:
+        raise RuntimeError(f"sin anuncios con ≥{cfg.get('min_usdt_available')} USDT disponibles y límite máx. "
+                           f"mayor a {cfg.get('max_order_usdt_trivial')} USDT")
     r = max(1, min(cfg["maker_rank"], len(buy), len(sell)))
     med = lambda ads: statistics.median(a["price"] for a in ads)  # noqa: E731
     s = {"name": name, "source": source or name,
@@ -992,18 +1016,18 @@ def evaluate_opp_alerts(al, cfg, opps):
     for o in opps["arbitrage"]:
         if o["net_pct"] >= a["arb_net_pct"]:
             al.fire(f"arb:{o['buy_on']}", "arb",
-                    f"💱 ARBITRAJE: compra en {o['buy_on'].title()} a {o['buy']:.2f} y vende en {o['sell_on'].title()} a {o['sell']:.2f}\n"
+                    f"💱 ARBITRAJE: compra en {o['buy_on'].title()} a {px(o['buy'], o['buy_on'])} y vende en {o['sell_on'].title()} a {px(o['sell'], o['sell_on'])}\n"
                     f"Neto {o['net_pct']:+.2f}% (≈ Bs {o['est_bob']:+,.0f} con tu capital; "
                     f"{o['net_after_transfer_pct']:+.2f}% si mueves USDT por la red).")
     for o in opps["taker"]:
         if o["net_pct"] >= a["taker_net_pct"]:
             al.fire(f"taker:{o['platform']}", "taker",
-                    f"⚡ {o['platform'].title()}: compra {o['buy']:.2f} / vende {o['sell']:.2f} → neto {o['net_pct']:+.2f}% "
+                    f"⚡ {o['platform'].title()}: compra {px(o['buy'], o['platform'])} / vende {px(o['sell'], o['platform'])} → neto {o['net_pct']:+.2f}% "
                     f"(≈ Bs {o['est_bob']:+,.0f}). Ejecuta rápido, estos cruces duran poco.")
     for o in opps["maker"]:
         if o["net_pct"] >= a["maker_net_pct"]:
             al.fire(f"maker:{o['platform']}", "maker",
-                    f"🧩 SPREAD en {o['platform'].title()}: publica compra ≈ {o['buy_price']:.2f} y venta ≈ {o['sell_price']:.2f} "
+                    f"🧩 SPREAD en {o['platform'].title()}: publica compra ≈ {px(o['buy_price'], o['platform'])} y venta ≈ {px(o['sell_price'], o['platform'])} "
                     f"→ neto {o['net_pct']:+.2f}% por ciclo (≈ Bs {o['est_bob']:+,.0f}).")
 
 
@@ -1101,7 +1125,7 @@ def make_report(kind, latest):
         if kind == "full":
             lines.append(f"📊 P2P USDT/BOB · {t}")
             for n, p in pl.items():
-                lines.append(f"{n.title()}: compra {p['best_buy']:.2f} · venta {p['best_sell']:.2f} · ref {p['ref']:.3f}")
+                lines.append(f"{n.title()}: compra {px(p['best_buy'], n)} · venta {px(p['best_sell'], n)} · ref {p['ref']:.3f}")
             ch = lambda v: f"{v:+.2f}%" if v is not None else "s/d"  # noqa: E731
             lines.append(f"Cambio: 30m {ch(ta.get('change_30m_pct'))} · 1h {ch(ta.get('change_1h_pct'))} · 24h {ch(ta.get('change_24h_pct'))}")
             lines.append(f"🧭 Escenario dominante: {sc['label']} (score {sc['score']:+.0f}, confianza {sc['confidence']})")
@@ -1232,7 +1256,7 @@ def rule_text(r):
         return f"{p} · spread ≥ {r['level']:g}%"
     side = "COMPRA" if r["side"] == "compra" else "VENTA"
     verb = "sube de" if r["dir"] == "sube" else "baja de"
-    return f"{p} · precio de {side} {verb} {r['level']:.2f}"
+    return f"{p} · precio de {side} {verb} {px(r['level'], r['platform'])}"
 
 
 def rule_value(r, platforms):
@@ -1251,17 +1275,18 @@ def rule_hit(r, v):
 
 
 def fmt_val(r, v):
-    return f"{v:.2f}%" if r["type"] == "spread" else f"{v:.2f}"
+    return f"{v:.2f}%" if r["type"] == "spread" else px(v, r["platform"])
 
 
 def rule_alert_text(r, v, platforms, cfg):
     p = platforms[r["platform"]]
     f = cfg[f"fee_{r['platform']}_pct"] / 100
-    ctx = f"Compra {p['best_buy']:.2f} · Venta {p['best_sell']:.2f}"
+    pn = r["platform"]
+    ctx = f"Compra {px(p['best_buy'], pn)} · Venta {px(p['best_sell'], pn)}"
     if r["type"] == "spread":
         body = f"Spread ahora: {v:.2f}% (neto tras comisión ≈ {maker_net_pct(p, f) * 100:+.2f}%)\n{ctx}"
     else:
-        body = f"Ahora: {v:.2f} Bs\n{ctx}"
+        body = f"Ahora: {px(v, pn)} Bs\n{ctx}"
     return f"🔔 Alerta #{r['id']}: {rule_text(r)}\n{body}"
 
 
@@ -1292,8 +1317,8 @@ def prices_text(platforms, cfg, ts, stale=False):
             continue
         f = cfg[f"fee_{n}_pct"] / 100
         L += [PLAT[n],
-              f"  Compra: {p['best_buy']:.2f}   Venta: {p['best_sell']:.2f}",
-              f"  Spread: {spread_pct(p):+.2f}% (Bs {p['best_buy'] - p['best_sell']:+.2f})",
+              f"  Compra: {px(p['best_buy'], n)}   Venta: {px(p['best_sell'], n)}",
+              f"  Spread: {spread_pct(p):+.2f}% (Bs {p['best_buy'] - p['best_sell']:+.3f})",
               f"  Neto tras comisión si publicas tus anuncios: {maker_net_pct(p, f) * 100:+.2f}%"]
     arb = opportunities(platforms, cfg)["arbitrage"]
     if arb:
@@ -1631,11 +1656,11 @@ class Bot:
             sign = 1 if d == "u" else -1
             rows = []
             if cur:
-                rows.append([btn(f"{cur + sign * x:.2f}", f"n:{typ}:{plat}:{d}:{cur + sign * x:.2f}")
+                rows.append([btn(px(cur + sign * x, plats[0]), f"n:{typ}:{plat}:{d}:{px(cur + sign * x, plats[0])}")
                              for x in (0.05, 0.10, 0.20)])
             rows.append([btn("⬅️ Atrás", f"n:{typ}:{plat}"), HOME])
             return self.tg.send(f"{pname} · {tname} {'sube de' if d == 'u' else 'baja de'} …\n"
-                                + (f"Ahora está en {cur:.2f}\n" if cur else "")
+                                + (f"Ahora está en {px(cur, plats[0])}\n" if cur else "")
                                 + "Elige un nivel o escribe el precio (ej. 12.00).", ikb(*rows), edit)
         self.state["pending"] = None
         self.add_rules(typ, plats, d, parse_float(a[4]), edit)
