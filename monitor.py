@@ -67,6 +67,9 @@ DEFAULTS = {
         "rsi_oversold": 30,
         "cooldown_min": {"move": 45, "arb": 30, "maker": 60, "taker": 30,
                          "signal": 120, "level": 120, "news": 360, "rule": 0},
+        "repeat_kinds": ["rule"],      # tipos de alerta que se repiten para que no pasen desapercibidos
+        "repeat_times": 3,             # mensajes en total (el primero + repeticiones)
+        "repeat_seconds": 15,          # segundos entre mensajes
     },
     "news": {
         "enabled": True, "max_age_hours": 72, "max_items": 6, "min_score": 7, "important_score": 11,
@@ -993,6 +996,29 @@ class Alerter:
         self.cfg, self.state, self.send, self.now = cfg, state, send, now
         self.last = state.setdefault("alert_last", {})
         self.log = state.setdefault("log", [])
+        self.queue = []  # repeticiones pendientes: [momento_epoch, texto]
+
+    def pending(self):
+        return bool(self.queue)
+
+    def next_due(self):
+        return min((q[0] for q in self.queue), default=None)
+
+    def flush_due(self, force=False):
+        """Envía las repeticiones cuyo momento ya llegó (o todas, esperando entre ellas, si force)."""
+        while self.queue:
+            self.queue.sort(key=lambda q: q[0])
+            due, text = self.queue[0]
+            wait = due - time.time()
+            if wait > 0:
+                if not force:
+                    return
+                time.sleep(min(wait, 20))
+            self.queue.pop(0)
+            try:
+                self.send(text)
+            except Exception as e:  # noqa: BLE001
+                print("repetición de alerta:", e, file=sys.stderr)
 
     def muted(self):
         return self.now.timestamp() < self.state.get("muted_until", 0)
@@ -1008,6 +1034,11 @@ class Alerter:
         self.log.append({"t": iso(self.now), "kind": kind, "text": text})
         del self.log[:-60]
         self.send(text)
+        a = self.cfg["alerts"]
+        n, gap = int(a.get("repeat_times") or 1), float(a.get("repeat_seconds") or 15)
+        if kind in a.get("repeat_kinds", []) and n > 1:
+            for i in range(2, n + 1):
+                self.queue.append([time.time() + gap * (i - 1), f"🔁 Alerta repetida {i}/{n}\n{text}"])
         return True
 
 
@@ -1815,11 +1846,16 @@ def live_loop(bot, al, state, cfg, refresh, deadline, data):
         if remaining <= 4:
             break
         try:
-            n = bot.poll(timeout=int(max(0, min(20, remaining - 3))))
+            al.flush_due()
+            due = al.next_due()
+            # con repeticiones pendientes no se espera Telegram más de lo necesario
+            wait = 20 if due is None else max(0, min(20, due - time.time()))
+            n = bot.poll(timeout=int(max(0, min(wait, remaining - 3))))
             if n is None:
                 time.sleep(3)
             elif n:
                 write_json(data / "state.json", state)
+            al.flush_due()
             if time.time() >= tick and deadline - time.time() > 10:
                 tick = time.time() + cfg["live_refresh_seconds"]
                 platforms, _ts, stale = refresh()
@@ -1831,6 +1867,7 @@ def live_loop(bot, al, state, cfg, refresh, deadline, data):
         except Exception as e:  # noqa: BLE001
             print("live error:", repr(e), file=sys.stderr)
             time.sleep(3)
+    al.flush_due(force=True)  # que no se pierdan repeticiones al terminar la ejecución
 
 
 def main():
