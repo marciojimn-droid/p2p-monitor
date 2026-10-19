@@ -31,7 +31,12 @@
       "level": 120,
       "news": 360,
       "rule": 0
-    }
+    },
+    "repeat_kinds": [
+      "rule"
+    ],
+    "repeat_times": 3,
+    "repeat_seconds": 15
   },
   "news": {
     "enabled": true,
