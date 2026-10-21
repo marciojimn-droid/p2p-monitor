@@ -36,6 +36,11 @@ from email.utils import parsedate_to_datetime
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
+try:  # retroalimentación semanal: si falta feedback.py el monitor sigue funcionando sin ella
+    import feedback as FB
+except Exception as _e:  # noqa: BLE001
+    FB = None
+    print("feedback.py no disponible:", _e, file=sys.stderr)
 LPZ = timezone(timedelta(hours=-4))  # Bolivia
 
 DEFAULTS = {
@@ -66,12 +71,20 @@ DEFAULTS = {
         "rsi_overbought": 70,
         "rsi_oversold": 30,
         "cooldown_min": {"move": 45, "arb": 30, "maker": 60, "taker": 30,
-                         "signal": 120, "level": 120, "news": 360, "rule": 0},
-        "repeat_kinds": ["rule"],      # tipos de alerta que se repiten para que no pasen desapercibidos
+                         "signal": 120, "level": 120, "news": 360, "rule": 0,
+                         "zone": 120, "breakout": 120, "bollinger": 180, "daily": 0, "weekly": 0},
+        "repeat_kinds": ["rule", "zone", "breakout", "maker"],  # se repiten para que no pasen desapercibidas
+        "breakout_margin_pct": 0.10,     # cuánto debe pasar el piso/techo de 3 días para llamarlo ruptura
+        "bollinger_min_width_pct": 0.25, # ancho mínimo de las bandas (si el precio está muy quieto, no avisa)
+        "daily_hour": 7,                 # hora local (Bolivia) del resumen diario
         "repeat_times": 3,             # mensajes en total (el primero + repeticiones)
         "repeat_seconds": 15,          # segundos entre mensajes
     },
+    "scenario_weights": {"rsi": 15, "macd": 20, "tendencia": 20, "momentum": 15, "profundidad": 10, "noticias": 20},
+    "feedback": {"enabled": True, "horizon_h": 6, "long_horizon_h": 24, "move_thr_pct": 0.20, "long_thr_pct": 0.40,
+                 "min_samples": 8, "weekday": 5, "hour": 8, "keep_days": 45},
     "news": {
+        "cat_weight": {},   # multiplicador por categoría en el escenario, ej. {"freight": 0.5}
         "enabled": True, "max_age_hours": 72, "max_items": 6, "min_score": 7, "important_score": 11,
         "alert_max_age_hours": 6, "alert_gap_min": 90, "max_article_fetches": 10,
         # secciones de economía que se leen directamente (prioridad máxima)
@@ -140,6 +153,9 @@ def iso(dt):
 
 def parse_iso(s):
     return datetime.strptime(s, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+
+
+DIAS = ["lun", "mar", "mié", "jue", "vie", "sáb", "dom"]
 
 
 def fmt_local(dt):
@@ -869,6 +885,10 @@ def technical_analysis(hist, price_now, now):
     if len(win) >= 12:
         ta["support"] = min(win)
         ta["resistance"] = max(win)
+        prev = closes[-73:-1]  # sin la última hora: para saber si el precio ACTUAL los rompe
+        if len(prev) >= 12:
+            ta["support_prev"] = min(prev)
+            ta["resistance_prev"] = max(prev)
     ta["sufficient"] = len(closes) >= 35
     return ta
 
@@ -887,8 +907,10 @@ def clamp(x, lo=-1.0, hi=1.0):
     return max(lo, min(hi, x))
 
 
-def build_scenario(ta, news, pressure):
+def build_scenario(ta, news, pressure, weights=None, cat_weight=None):
     comps, reasons = [], []
+    W = dict({"rsi": 15, "macd": 20, "tendencia": 20, "momentum": 15, "profundidad": 10, "noticias": 20}, **(weights or {}))
+    CW = cat_weight or {}
 
     def add(name, value, weight, text):
         comps.append((name, value, weight))
@@ -898,14 +920,14 @@ def build_scenario(ta, news, pressure):
     r = ta.get("rsi")
     if r is not None:
         v = 0.6 if r < 30 else 0.2 if r < 40 else -0.6 if r > 70 else -0.2 if r > 60 else 0.0
-        add("rsi", v, 15, f"RSI {r:.0f}: " + ("sobrevendido, posible rebote" if v > 0.3 else
+        add("rsi", v, W["rsi"], f"RSI {r:.0f}: " + ("sobrevendido, posible rebote" if v > 0.3 else
                                               "zona baja" if v > 0 else
                                               "sobrecomprado, posible corrección" if v < -0.3 else "zona alta"))
     m = ta.get("macd")
     if m:
         h, hp = m["hist"], m["hist_prev"]
         v = 1.0 if (h > 0 and h > hp) else 0.3 if h > 0 else -1.0 if (h < 0 and h < hp) else -0.3
-        add("macd", v, 20, "MACD " + ("alcista y acelerando" if v == 1 else "positivo pero perdiendo fuerza" if v == 0.3
+        add("macd", v, W["macd"], "MACD " + ("alcista y acelerando" if v == 1 else "positivo pero perdiendo fuerza" if v == 0.3
                                       else "bajista y acelerando" if v == -1 else "negativo pero mejorando"))
     e20, e50, price = ta.get("ema20"), ta.get("ema50"), ta.get("price")
     if e20 and price:
@@ -913,22 +935,24 @@ def build_scenario(ta, news, pressure):
         v += 0.5 if price > e20 else -0.5
         if e50:
             v += 0.5 if e20 > e50 else -0.5
-        add("tendencia", v, 20, "Tendencia " + ("alcista (precio sobre medias)" if v > 0 else "bajista (precio bajo medias)"))
+        add("tendencia", v, W["tendencia"], "Tendencia " + ("alcista (precio sobre medias)" if v > 0 else "bajista (precio bajo medias)"))
     mom = ta.get("change_3h_pct")
     if mom is not None:
         v = clamp(mom / 0.6)
-        add("momentum", v, 15, f"Momentum 3h {mom:+.2f}%")
-    add("profundidad", clamp(pressure * 2), 10,
+        add("momentum", v, W["momentum"], f"Momentum 3h {mom:+.2f}%")
+    add("profundidad", clamp(pressure * 2), W["profundidad"],
         "Más demanda que oferta de USDT en los libros" if pressure > 0.1 else
         "Más oferta que demanda de USDT en los libros" if pressure < -0.1 else "")
     if news:
         recent = [n for n in news if n["score"] != 0][:10]
-        s = sum(n["score"] * (1.5 if n.get("important") else 1) for n in recent)
+        s = sum(n["score"] * CW.get(n.get("cat"), 1.0) * (1.5 if n.get("important") else 1) for n in recent)
         v = clamp(s / 4)
-        add("noticias", v, 20, ("Noticias con sesgo alcista para el dólar" if v > 0 else "Noticias con sesgo bajista para el dólar")
+        add("noticias", v, W["noticias"], ("Noticias con sesgo alcista para el dólar" if v > 0 else "Noticias con sesgo bajista para el dólar")
             if abs(v) > 0.05 else "")
     used_w = sum(w for _, _, w in comps) or 1
     score = sum(v * w for _, v, w in comps) / used_w * 100
+    nn = [(n_, v, w) for n_, v, w in comps if n_ != "noticias"]
+    score_nn = sum(v * w for _, v, w in nn) / (sum(w for _, _, w in nn) or 1) * 100 if nn else 0.0
     label = "ALZA" if score >= 25 else "BAJA" if score <= -25 else "ESTABLE"
     nz = [v for _, v, _ in comps if abs(v) > 0.05]
     agree = sum(1 for v in nz if (v > 0) == (score > 0)) / len(nz) if nz else 0
@@ -938,7 +962,8 @@ def build_scenario(ta, news, pressure):
         conf = "baja"
         reasons.append("Historial corto: RSI/MACD aún poco fiables (se afinan solos con el tiempo)")
     return {"label": label, "score": round(score, 1), "confidence": conf,
-            "strong": abs(score) >= 50, "reasons": reasons}
+            "strong": abs(score) >= 50, "reasons": reasons,
+            "score_nn": round(score_nn, 1), "comps": {n_: round(v, 2) for n_, v, _ in comps}}
 
 
 # ───────────────────────── oportunidades ─────────────────────────
@@ -997,6 +1022,7 @@ class Alerter:
         self.last = state.setdefault("alert_last", {})
         self.log = state.setdefault("log", [])
         self.queue = []  # repeticiones pendientes: [momento_epoch, texto]
+        self.events = []  # señales disparadas en esta ejecución (para la retroalimentación)
 
     def pending(self):
         return bool(self.queue)
@@ -1023,7 +1049,7 @@ class Alerter:
     def muted(self):
         return self.now.timestamp() < self.state.get("muted_until", 0)
 
-    def fire(self, key, kind, text, cd_min=None):
+    def fire(self, key, kind, text, cd_min=None, ev=None):
         if kind in self.state.get("auto_off", []) or self.muted():
             return False
         cd = (self.cfg["alerts"]["cooldown_min"].get(kind, 60) if cd_min is None else cd_min) * 60
@@ -1034,6 +1060,8 @@ class Alerter:
         self.log.append({"t": iso(self.now), "kind": kind, "text": text})
         del self.log[:-60]
         self.send(text)
+        if ev:
+            self.events.append(ev)
         a = self.cfg["alerts"]
         n, gap = int(a.get("repeat_times") or 1), float(a.get("repeat_seconds") or 15)
         if kind in a.get("repeat_kinds", []) and n > 1:
@@ -1062,6 +1090,104 @@ def evaluate_opp_alerts(al, cfg, opps):
                     f"→ neto {o['net_pct']:+.2f}% por ciclo (≈ Bs {o['est_bob']:+,.0f}).")
 
 
+def evaluate_breakout(al, cfg, ta, price):
+    """Ruptura: el precio ACTUAL pasa el piso o el techo de los últimos 3 días."""
+    m = cfg["alerts"]["breakout_margin_pct"] / 100
+    sup, res = ta.get("support_prev"), ta.get("resistance_prev")
+    if sup and price <= sup * (1 - m):
+        al.fire("breakout:down", "breakout",
+                f"💥 RUPTURA de SOPORTE: el USDT cayó a {price:.3f}, bajo el piso de 3 días ({sup:.3f}).\n"
+                "La señal de compra por soporte ya no vale: evita comprar en la caída y espera que se estabilice. "
+                f"Si en 1 o 2 horas vuelve sobre {sup:.3f}, fue una falsa ruptura.",
+                ev={"typ": "ruptura_soporte", "p": price})
+    if res and price >= res * (1 + m):
+        al.fire("breakout:up", "breakout",
+                f"💥 RUPTURA de RESISTENCIA: el USDT subió a {price:.3f}, sobre el techo de 3 días ({res:.3f}).\n"
+                "La señal de venta por techo pierde validez y el alza puede continuar: si vendes, hazlo por tramos; "
+                f"si piensas comprar, no persigas el precio. Si vuelve bajo {res:.3f}, fue una falsa ruptura.",
+                ev={"typ": "ruptura_resistencia", "p": price})
+
+
+def evaluate_bollinger(al, cfg, ta, price):
+    """Bandas de Bollinger (20 h): el precio toca una banda → está 'estirado' respecto a su promedio."""
+    b = ta.get("bollinger")
+    if not b or not price or b["mid"] <= 0:
+        return
+    if (b["upper"] - b["lower"]) / b["mid"] * 100 < cfg["alerts"]["bollinger_min_width_pct"]:
+        return
+    r = ta.get("rsi")
+    rtxt = "" if r is None else f" RSI {r:.0f}"
+    if price >= b["upper"]:
+        conf = "" if r is None else (" (confirma sobrecompra)" if r >= 65 else " (el RSI no confirma, cuidado)")
+        al.fire("boll:up", "bollinger",
+                f"📈 BOLLINGER banda SUPERIOR: {price:.3f} sobre {b['upper']:.3f}; está estirado frente a su promedio "
+                f"de 20 h ({b['mid']:.3f}).{rtxt}{conf}\nSuele corregir hacia el promedio, salvo tendencia fuerte: "
+                "buena zona para vender o no comprar.", ev={"typ": "bollinger_sup", "p": price})
+    elif price <= b["lower"]:
+        conf = "" if r is None else (" (confirma sobreventa)" if r <= 35 else " (el RSI no confirma, cuidado)")
+        al.fire("boll:down", "bollinger",
+                f"📉 BOLLINGER banda INFERIOR: {price:.3f} bajo {b['lower']:.3f}; está estirado a la baja frente a su "
+                f"promedio de 20 h ({b['mid']:.3f}).{rtxt}{conf}\nSuele rebotar hacia el promedio, salvo tendencia "
+                "bajista fuerte: buena zona para comprar por tramos.", ev={"typ": "bollinger_inf", "p": price})
+
+
+def daily_text(cfg, hist, ta, scen, platforms, news, now):
+    loc = now.astimezone(LPZ)
+    L = [f"☀️ Buenos días · P2P USDT/BOB · {DIAS[loc.weekday()]} {loc.strftime('%d/%m')}"]
+    for n in ("binance", "bybit"):
+        p = platforms.get(n)
+        if p:
+            f = cfg[f"fee_{n}_pct"] / 100
+            L.append(f"{PLAT[n]}: compra {px(p['best_buy'], n)} · venta {px(p['best_sell'], n)} · "
+                     f"spread {spread_pct(p):+.2f}% (neto maker {maker_net_pct(p, f) * 100:+.2f}%)")
+    day0 = loc.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=1)
+    day1 = day0 + timedelta(days=1)
+    pts = []
+    for r in hist:
+        pr = r.get("br") or r.get("yr")
+        if pr and not r.get("seed") and day0 <= parse_iso(r["t"]).astimezone(LPZ) < day1:
+            pts.append(pr)
+    if len(pts) >= 5:
+        L.append(f"Ayer: abrió {pts[0]:.3f} · cerró {pts[-1]:.3f} ({(pts[-1] / pts[0] - 1) * 100:+.2f}%) · "
+                 f"mín {min(pts):.3f} · máx {max(pts):.3f} (rango {(max(pts) / min(pts) - 1) * 100:.2f}%)")
+    if ta.get("support"):
+        L.append(f"Mapa de hoy: soporte {ta['support']:.3f} · resistencia {ta['resistance']:.3f}"
+                 + (f" · RSI {ta['rsi']:.0f}" if ta.get("rsi") is not None else ""))
+    L.append(f"Escenario: {scen['label']} (puntaje {scen['score']:+.0f}, confianza {scen['confidence']})")
+    for r in scen["reasons"][:3]:
+        L.append(f"  • {r}")
+    top = [n for n in news if n.get("important")][:2] or news[:1]
+    if top:
+        L.append("Noticias clave:")
+        for n in top:
+            arrow = {"sube": "↑", "baja": "↓", "neutral": "•"}[n["direction"]]
+            L.append(f"  {arrow} {n['title']} ({n.get('source', '')})")
+    L.append("No es asesoría financiera.")
+    return "\n".join(L)
+
+
+def maybe_daily(al, cfg, hist, ta, scen, platforms, news, now):
+    loc = now.astimezone(LPZ)
+    day = loc.date().isoformat()
+    if al.state.get("daily_sent") == day or not (cfg["alerts"]["daily_hour"] <= loc.hour < 12):
+        return
+    if al.fire("daily", "daily", daily_text(cfg, hist, ta, scen, platforms, news, now), cd_min=0):
+        al.state["daily_sent"] = day
+
+
+def maybe_weekly(al, fb, cfg, now):
+    """Sábado por la mañana: informe de aciertos de la semana."""
+    fc = cfg["feedback"]
+    loc = now.astimezone(LPZ)
+    key = loc.date().isoformat()
+    if al.state.get("weekly_sent") == key or loc.weekday() != fc["weekday"] or loc.hour < fc["hour"]:
+        return
+    text = FB.report_text(fb, now, fc)
+    if al.fire("weekly", "weekly", text, cd_min=0):
+        al.state["weekly_sent"] = key
+        fb["reports"].append({"t": iso(now), "text": text})
+
+
 def evaluate_alerts(al, cfg, ta, scen, opps, news, platforms, price, prev_label):
     a = cfg["alerts"]
     for win, key, thr in ((30, "change_30m_pct", a["move_pct_30m"]), (120, "change_2h_pct", a["move_pct_2h"])):
@@ -1081,7 +1207,10 @@ def evaluate_alerts(al, cfg, ta, scen, opps, news, platforms, price, prev_label)
                 "\n- ".join(scen["reasons"][:4]))
     for s in build_signals(ta, scen, cfg):
         if s["type"] in ("compra", "venta"):
-            al.fire(f"signal:{s['type']}", "signal", ("🟢 " if s["type"] == "compra" else "🔴 ") + s["text"])
+            al.fire(f"zone:{s['type']}", "zone", ("🟢 " if s["type"] == "compra" else "🔴 ") + s["text"],
+                    ev={"typ": f"zona_{s['type']}", "p": price})
+    evaluate_breakout(al, cfg, ta, price)
+    evaluate_bollinger(al, cfg, ta, price)
     # noticias: solo las clave, nuevas (últimas horas) y con efecto claro; una cada ~90 min como máximo
     ncfg = cfg["news"]
     sent = al.state.setdefault("news_sent", [])
@@ -1197,14 +1326,20 @@ PLAT_WORDS = {"binance": ["binance"], "bybit": ["bybit"], "ambas": ["binance", "
 UP_WORDS_CMD = {"sube", "subir", "sobre", "arriba", "mayor", "encima", "supera", "alza"}
 DOWN_WORDS_CMD = {"baja", "bajar", "bajo", "abajo", "menor", "debajo", "cae", "caiga"}
 AUTO = {"move": "Movimiento del precio", "arb": "Arbitraje Binance↔Bybit", "taker": "Cruce directo",
-        "maker": "Spread como maker", "signal": "Señales y escenario", "news": "Noticias de impacto"}
+        "maker": "Spread como maker", "signal": "Cambio de escenario", "news": "Noticias de impacto",
+        "zone": "Zona de compra/venta (RSI)", "breakout": "Ruptura de soporte/resistencia",
+        "bollinger": "Bandas de Bollinger", "daily": "Resumen diario", "weekly": "Informe semanal de aciertos"}
 AUTO_SHORT = {"move": "Movimiento", "arb": "Arbitraje", "taker": "Cruce", "maker": "Maker",
-              "signal": "Señales", "news": "Noticias"}
+              "signal": "Escenario", "news": "Noticias", "zone": "Zonas", "breakout": "Rupturas",
+              "bollinger": "Bollinger", "daily": "Diario", "weekly": "Semanal"}
 AUTO_ALIASES = {"movimiento": "move", "mov": "move", "arbitraje": "arb", "cruce": "taker", "taker": "taker",
-                "maker": "maker", "senales": "signal", "senal": "signal", "noticias": "news", "noticia": "news"}
+                "maker": "maker", "senales": "signal", "senal": "signal", "escenario": "signal", "noticias": "news",
+                "noticia": "news", "zona": "zone", "zonas": "zone", "ruptura": "breakout", "rupturas": "breakout",
+                "bollinger": "bollinger", "diario": "daily", "resumen": "daily", "semanal": "weekly",
+                "semana": "weekly", "informe": "weekly"}
 FOREVER = 4102444800  # año 2100: "pausa hasta que yo la reanude"
 MAX_RULES = 20
-UI_VERSION = 2
+UI_VERSION = 3
 
 BOT_COMMANDS = [
     ("menu", "Menú principal"), ("precios", "Precios y spread Binance/Bybit"), ("alertas", "Mis alertas activas"),
@@ -1213,11 +1348,13 @@ BOT_COMMANDS = [
     ("desactivar", "Desactivar una alerta o todas"), ("activar", "Activar una alerta o todas"),
     ("borrar", "Borrar una alerta"), ("pausar", "Pausar todas las alertas"),
     ("estado", "Análisis del mercado"), ("noticias", "Noticias que mueven el dólar"),
+    ("semana", "Aciertos del sistema (informe semanal)"),
 ]
 COMMAND_WORDS = {"compra", "venta", "spread", "desactivar", "activar", "borrar", "quitar", "eliminar", "pausar",
                  "reanudar", "mov", "precios", "precio", "alertas", "alerta", "menu", "ayuda", "help", "estado",
-                 "noticias", "oportunidades", "nueva", "start", "analisis", "apagar", "encender"}
-KEYWORDS = [("analisis mercado p2p", "estado"), ("mis alertas", "alertas"), ("nueva alerta", "nueva"),
+                 "noticias", "oportunidades", "nueva", "start", "analisis", "apagar", "encender", "semana",
+                 "informe", "aciertos"}
+KEYWORDS = [("aciertos", "semana"), ("informe semanal", "semana"), ("analisis mercado p2p", "estado"), ("mis alertas", "alertas"), ("nueva alerta", "nueva"),
             ("precios", "precios"), ("noticias", "noticias"), ("oportunidades", "oportunidades"),
             ("reanudar", "reanudar"), ("pausar", "pausar"), ("analisis", "estado")]
 
@@ -1226,7 +1363,8 @@ HELP_TEXT = (
     "Ver\n"
     "/precios → compra, venta y spread en Binance y Bybit\n"
     "/alertas → tus alertas activas (con botones)\n"
-    "/estado → análisis del mercado · /noticias\n\n"
+    "/estado → análisis del mercado · /noticias\n"
+    "/semana → qué tanto acertó el sistema (informe semanal, también llega solo los sábados)\n\n"
     "Crear alertas\n"
     "/nueva → paso a paso con botones\n"
     "/compra binance sube 12 → avisa si el precio de COMPRA llega a 12 o más\n"
@@ -1237,7 +1375,7 @@ HELP_TEXT = (
     "Administrar\n"
     "/desactivar 3 · /activar 3 · /borrar 3 (3 = número de la alerta)\n"
     "/desactivar todas · /activar todas · /borrar todas\n"
-    "/desactivar movimiento (también: arbitraje, cruce, maker, senales, noticias)\n"
+    "/desactivar movimiento (también: arbitraje, cruce, maker, escenario, zonas, rupturas, bollinger, diario, semanal, noticias)\n"
     "/pausar 2h · /reanudar\n"
     "/mov 0.3 → sensibilidad del aviso de movimiento (% en 30 min)\n\n"
     "Compra = lo que pagas por cada USDT. Venta = lo que recibes por cada USDT. "
@@ -1256,7 +1394,8 @@ def ikb(*rows):
 HOME = btn("🏠 Menú", "m")
 MAIN_KB = ikb([btn("💱 Precios y spread", "p"), btn("🔔 Mis alertas", "l")],
               [btn("➕ Nueva alerta", "n"), btn("⏸ Pausar", "z")],
-              [btn("📊 Análisis", "an"), btn("📰 Noticias", "nw")])
+              [btn("📊 Análisis", "an"), btn("📰 Noticias", "nw")],
+              [btn("🎯 Aciertos del sistema", "wk")])
 REPLY_KB = {"keyboard": [[{"text": "💱 Precios"}, {"text": "🔔 Mis alertas"}],
                          [{"text": "➕ Nueva alerta"}, {"text": "⏸ Pausar"}],
                          [{"text": "📊 Análisis"}, {"text": "📰 Noticias"}]],
@@ -1368,6 +1507,10 @@ class Bot:
         state.setdefault("next_id", 1)
         state.setdefault("auto_off", [])
         state.setdefault("muted_until", 0)
+        if not state.get("mig_zone"):  # las zonas de compra/venta ahora tienen su propio interruptor
+            if "signal" in state["auto_off"] and "zone" not in state["auto_off"]:
+                state["auto_off"].append("zone")
+            state["mig_zone"] = True
 
     # ── lectura de mensajes ──────────────────────────────────────────
 
@@ -1434,7 +1577,8 @@ class Bot:
              "alerta": self.show_alerts, "nueva": self.wizard_start,
              "estado": lambda: self.report("full"), "analisis": lambda: self.report("full"),
              "oportunidades": lambda: self.report("opps"), "noticias": lambda: self.report("news"),
-             "reanudar": self.resume}.get(cmd)
+             "reanudar": self.resume, "semana": self.weekly_report, "informe": self.weekly_report,
+             "aciertos": self.weekly_report}.get(cmd)
         if h:
             return h()
         if cmd in ("compra", "venta"):
@@ -1580,7 +1724,7 @@ class Bot:
     def menu(self, start=False, edit=None):
         n = sum(1 for r in self.state["rules"] if r.get("active", True))
         if start:
-            self.tg.send("👋 Menú actualizado: ahora puedes crear y administrar alertas con botones.\n"
+            self.tg.send("👋 Menú actualizado: nuevas alertas (rupturas, Bollinger, resumen diario) y el informe de aciertos /semana.\n"
                          "Usa los botones de abajo, o escribe «/» para ver todos los comandos.", REPLY_KB)
         txt = "🤖 Monitor P2P USDT/BOB\n"
         txt += "🔇 Alertas en pausa\n" if self.muted() else ""
@@ -1601,6 +1745,10 @@ class Bot:
             return self.tg.send("Todavía no tengo datos de mercado completos. Prueba en unos minutos.", ikb([HOME]))
         self.tg.send(make_report(kind, lat), ikb([HOME]))
 
+    def weekly_report(self, edit=None):
+        fn = self.ctx.get("weekly")
+        self.tg.send(fn() if fn else "Informe no disponible.", ikb([HOME]), edit)
+
     def show_alerts(self, edit=None):
         st, a = self.state, self.cfg["alerts"]
         mu = st.get("muted_until", 0)
@@ -1618,10 +1766,15 @@ class Bot:
             L.append(f"#{r['id']} {'✅' if r.get('active', True) else '⏹'} {rule_text(r)}{tail}")
         detail = {"move": f"({a['move_pct_30m']:g}% en 30 min · {a['move_pct_2h']:g}% en 2 h)",
                   "arb": f"(neto ≥ {a['arb_net_pct']:g}%)", "taker": f"(neto ≥ {a['taker_net_pct']:g}%)",
-                  "maker": f"(neto ≥ {a['maker_net_pct']:g}%)"}
+                  "maker": f"(neto ≥ {a['maker_net_pct']:g}%)",
+                  "zone": f"(RSI ≥{a['rsi_overbought']} / ≤{a['rsi_oversold']} cerca del techo / piso)",
+                  "breakout": f"(>{a['breakout_margin_pct']:g}% fuera del rango de 3 días)",
+                  "bollinger": "(precio en la banda de 20 h)",
+                  "daily": f"(cada día {a['daily_hour']}:00)", "weekly": "(sábados)"}
         L += ["", "Automáticas:"]
         for k, name in AUTO.items():
-            L.append(f"{'⏹' if k in st['auto_off'] else '✅'} {name} {detail.get(k, '')}".rstrip())
+            rp = f" ×{a['repeat_times']}" if k in a.get("repeat_kinds", []) else ""
+            L.append(f"{'⏹' if k in st['auto_off'] else '✅'} {name} {detail.get(k, '')}{rp}".rstrip())
         rows = []
         for r in st["rules"]:
             rows.append([btn(f"{'⏹ Pausar' if r.get('active', True) else '▶ Activar'} #{r['id']}", f"t:{r['id']}"),
@@ -1767,6 +1920,8 @@ class Bot:
             return self.report("news")
         if k == "op":
             return self.report("opps")
+        if k == "wk":
+            return self.weekly_report()
 
     # ── primera vez tras actualizar ──────────────────────────────────
 
@@ -1888,6 +2043,11 @@ def main():
     hist = read_json(data / "history.json", [])
     state = read_json(data / "state.json", {})
     cfg["alerts"].update(state.get("settings", {}))
+    fb = None
+    if FB and cfg["feedback"].get("enabled"):
+        fb = read_json(data / "feedback.json", None) or FB.new_store()
+        for k_, v_ in FB.new_store().items():
+            fb.setdefault(k_, v_)
     live = args.live if args.live is not None else int(os.environ.get("LIVE_SECONDS") or cfg["live_seconds"])
     tg = Telegram(os.environ.get("TELEGRAM_BOT_TOKEN"), os.environ.get("TELEGRAM_CHAT_ID"), args.dry_run or args.demo)
     ws_token = os.environ.get("WAVESOFT_TOKEN")
@@ -1928,7 +2088,7 @@ def main():
         price = rec.get("br") or rec.get("yr")
         ta = technical_analysis(hist, price, now)
         pressure = depth_pressure(platforms)
-        scen = build_scenario(ta, news, pressure)
+        scen = build_scenario(ta, news, pressure, cfg.get("scenario_weights"), cfg["news"].get("cat_weight"))
         opps = opportunities(platforms, cfg)
         signals = build_signals(ta, scen, cfg)
         prev_label = state.get("scenario_label")
@@ -1951,6 +2111,19 @@ def main():
 
         evaluate_alerts(al, cfg, ta, scen, opps, news, platforms, price, prev_label)
         evaluate_rules(al, state, platforms)
+        maybe_daily(al, cfg, hist, ta, scen, platforms, news, now)
+        if fb is not None:
+            try:
+                FB.log_pred(fb, now, price, scen, ta, news)
+                FB.log_news_events(fb, now, price, news)
+                for ev in al.events:
+                    FB.log_event(fb, now, ev["typ"], ev["p"])
+                FB.resolve(fb, hist, now, cfg["feedback"])
+                FB.prune(fb, now, cfg["feedback"]["keep_days"])
+                maybe_weekly(al, fb, cfg, now)
+            except Exception as e:  # noqa: BLE001
+                errors.append(f"Retroalimentación: {e}")
+            write_json(data / "feedback.json", fb)
         state["scenario_label"] = scen["label"] if scen["strong"] else (prev_label or scen["label"])
         latest["alerts"] = list(reversed(state.get("log", [])))[:30]
 
@@ -1972,14 +2145,20 @@ def main():
             cur["platforms"], cur["ts"] = p, now_utc()
         return cur["platforms"], cur["ts"], not p
 
+    def weekly():
+        if fb is None:
+            return "El informe de aciertos no está activo (falta feedback.py en el repositorio)."
+        return FB.report_text(fb, now_utc(), cfg["feedback"], partial=True)
+
     bot = Bot(tg, cfg, state, {"platforms": lambda: cur["platforms"], "refresh": refresh,
-                               "latest": lambda: latest})
+                               "latest": lambda: latest, "weekly": weekly})
     if tg.enabled and not args.demo and not args.dry_run:
         bot.first_run_setup()
         if live > 0:
             live_loop(bot, al, state, cfg, refresh, t0 + live, data)
         else:
             bot.poll(0)
+            al.flush_due(force=True)
     write_json(data / "state.json", state)
     return 0
 
