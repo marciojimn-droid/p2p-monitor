@@ -8,6 +8,9 @@
   "transfer_size_usdt": 300,
   "min_monthly_orders": 30,
   "min_finish_rate": 0.9,
+  "exact_mode": true,
+  "min_usdt_available": 30,
+  "max_order_usdt_trivial": 9,
   "maker_rank": 3,
   "history_max": 4000,
   "live_seconds": 420,
@@ -30,15 +33,46 @@
       "signal": 120,
       "level": 120,
       "news": 360,
-      "rule": 0
+      "rule": 0,
+      "zone": 120,
+      "breakout": 120,
+      "bollinger": 180,
+      "daily": 0,
+      "weekly": 0
     },
     "repeat_kinds": [
-      "rule"
+      "rule",
+      "zone",
+      "breakout",
+      "maker"
     ],
+    "breakout_margin_pct": 0.1,
+    "bollinger_min_width_pct": 0.25,
+    "daily_hour": 7,
     "repeat_times": 3,
     "repeat_seconds": 15
   },
+  "scenario_weights": {
+    "rsi": 15,
+    "macd": 20,
+    "tendencia": 20,
+    "momentum": 15,
+    "profundidad": 10,
+    "noticias": 20
+  },
+  "feedback": {
+    "enabled": true,
+    "horizon_h": 6,
+    "long_horizon_h": 24,
+    "move_thr_pct": 0.2,
+    "long_thr_pct": 0.4,
+    "min_samples": 8,
+    "weekday": 5,
+    "hour": 8,
+    "keep_days": 45
+  },
   "news": {
+    "cat_weight": {},
     "enabled": true,
     "max_age_hours": 72,
     "max_items": 6,
@@ -152,8 +186,5 @@
         "when": "2d"
       }
     ]
-  },
-  "exact_mode": true,
-  "min_usdt_available": 30,
-  "max_order_usdt_trivial": 9
+  }
 }
