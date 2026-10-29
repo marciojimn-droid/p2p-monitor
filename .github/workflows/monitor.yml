@@ -2,11 +2,12 @@ name: Monitor P2P USDT-BOB
 
 on:
   schedule:
-    - cron: "*/5 * * * *"   # cada 5 minutos (GitHub puede demorar algunos minutos en horas de mucha carga)
+    - cron: "*/15 * * * *"   # respaldo: si la cadena se corta, esto la reinicia (GitHub puede atrasarlo)
   workflow_dispatch:          # permite ejecutarlo a mano desde la pestaña Actions
 
 permissions:
   contents: write
+  actions: write              # para que cada ejecución arranque la siguiente
 
 concurrency:
   group: p2p-monitor
@@ -15,8 +16,11 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 11
+    timeout-minutes: 12
     steps:
+      - name: Marcar inicio
+        run: echo "START_TS=$(date +%s)" >> "$GITHUB_ENV"
+
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
@@ -34,8 +38,7 @@ jobs:
             || mkdir -p datadir
           rm -rf datadir/.git
 
-      # Cada ejecución dura ~8 min (más que el cron de 5 min, así siempre hay otra en cola esperando y el bot no queda sin escuchar)
-      # ~4 min: revisa precios y se queda escuchando Telegram para
+      # Cada ejecución dura ~8 min: revisa precios y se queda escuchando Telegram para
       # responder a tus botones casi al instante y vigilar tus alertas cada minuto.
       - name: Ejecutar monitor
         timeout-minutes: 9
@@ -59,3 +62,14 @@ jobs:
           git commit -qm "datos $(date -u +%Y-%m-%dT%H:%M:%SZ)"
           git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
           git push -q -f origin data
+
+      # Cadena sin depender del reloj de GitHub: al terminar, esta ejecución lanza la siguiente.
+      # (El 'sleep' evita un bucle rápido si algo fallara al instante.)
+      - name: Lanzar la siguiente ejecución
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          elapsed=$(( $(date +%s) - START_TS ))
+          if [ "$elapsed" -lt 240 ]; then sleep $(( 240 - elapsed )); fi
+          gh workflow run monitor.yml --ref "${GITHUB_REF_NAME}" || echo "no se pudo encadenar; el cron lo reiniciará"
