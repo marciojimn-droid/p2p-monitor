@@ -30,10 +30,11 @@ COMP_NAMES = {"rsi": "RSI", "macd": "MACD", "tendencia": "Tendencia (medias)", "
               "profundidad": "Libro de órdenes", "noticias": "Noticias"}
 SIG_NAMES = {"zona_compra": "Zona de compra", "zona_venta": "Zona de venta",
              "ruptura_soporte": "Ruptura de soporte", "ruptura_resistencia": "Ruptura de resistencia",
-             "bollinger_sup": "Bollinger banda superior", "bollinger_inf": "Bollinger banda inferior"}
+             "bollinger_sup": "Bollinger banda superior", "bollinger_inf": "Bollinger banda inferior",
+             "rebote_compra": "Rebote confirmado (compra)", "rebote_techo": "Techo del rebote (venta)"}
 # movimiento que se espera a favor de cada señal (+1 sube, -1 baja)
 SIG_DIR = {"zona_compra": 1, "zona_venta": -1, "ruptura_soporte": -1, "ruptura_resistencia": 1,
-           "bollinger_sup": -1, "bollinger_inf": 1}
+           "bollinger_sup": -1, "bollinger_inf": 1, "rebote_compra": 1, "rebote_techo": -1}
 
 
 def _p(s):
@@ -64,7 +65,18 @@ def _jac(a, b):
 # ───────────────────────── registro ─────────────────────────
 
 def new_store():
-    return {"preds": [], "events": [], "reports": [], "news_seen": []}
+    return {"preds": [], "events": [], "reports": [], "news_seen": [], "cycles": []}
+
+
+def log_cycle(fb, cyc):
+    """Un ciclo del rebote (compra en el rebote → venta en el techo, o invalidado) de una combinación de umbrales.
+    cyc = {v: 'caída_confirma_ventana', tb, pb, ts, ps, pct, why}. Se conservan los últimos ~5000."""
+    cs = fb.setdefault("cycles", [])
+    if any(c.get("v") == cyc["v"] and c.get("tb") == cyc["tb"] for c in cs[-300:]):
+        return False
+    cs.append(cyc)
+    del cs[:-5000]
+    return True
 
 
 def log_pred(fb, now, price, scen, ta, news):
@@ -161,7 +173,33 @@ def prune(fb, now, days):
     cut = _i(now - timedelta(days=days))
     fb["preds"] = [r for r in fb["preds"] if r["t"] >= cut]
     fb["events"] = [r for r in fb["events"] if r["t"] >= cut]
+    fb["cycles"] = [c for c in fb.get("cycles", []) if c.get("ts", "") >= cut]
     fb["reports"] = fb.get("reports", [])[-12:]
+
+
+def rebound_table(fb, now, days, min_cycles=3):
+    """Compara las combinaciones del rebote: ciclos, % de ganadores, ganancia media por ciclo (a favor de la venta
+    real al cerrar) y total. Orden: ganancia total. Devuelve lista de dicts."""
+    since = _i(now - timedelta(days=days))
+    by = {}
+    for c in fb.get("cycles", []):
+        if c.get("ts", "") >= since and _num(c.get("pct")):
+            by.setdefault(c["v"], []).append(c)
+    out = []
+    for v, cs in by.items():
+        pcts = [c["pct"] for c in cs]
+        out.append({"v": v, "n": len(cs), "wins": sum(1 for x in pcts if x > 0), "avg": sum(pcts) / len(pcts),
+                    "total": sum(pcts), "worst": min(pcts), "enough": len(cs) >= min_cycles})
+    out.sort(key=lambda r: (-int(r["enough"]), -r["total"]))
+    return out
+
+
+def fmt_variant(v):
+    try:
+        d, c, w = v.split("_")
+        return f"caída {d}% · confirma {c}% · ventana {int(w) // 60 if int(w) % 60 == 0 else w} {'h' if int(w) % 60 == 0 else 'min'}"
+    except Exception:  # noqa: BLE001
+        return v
 
 
 # ───────────────────────── evaluación ─────────────────────────
@@ -332,6 +370,25 @@ def report_text(fb, now, cfg, partial=False):
         L += ["", "🚦 Señales (precio a 6 h, a favor de la señal)"]
         for typ, c in week["signals"].items():
             L.append(f"• {SIG_NAMES[typ]}: {c['hits']}/{c['n']} ({_pct(c['hits'], c['n'])}) · movimiento medio a favor {c['sum'] / c['n']:+.2f}%")
+
+    rt = rebound_table(fb, now, 7)
+    rt28 = rebound_table(fb, now, 28)
+    L += ["", "🔁 Rebote en Bybit: ¿qué porcentajes rinden mejor? (compra al confirmar → venta en el techo)"]
+    if not rt and not rt28:
+        L.append("• Aún sin ciclos completos: con caída de 1% casi no hay señales; las combinaciones más sensibles "
+                 "(0.3–0.5%) sirven para comparar. Se llena solo con los días.")
+    else:
+        src, label = (rt, "esta semana") if rt else (rt28, "últimas 4 semanas")
+        L.append(f"({label}; ciclos = compra→venta completos, % = resultado antes de comisiones, Bybit 0%)")
+        for i, r in enumerate(src[:5]):
+            tag = "🥇 " if i == 0 and r["enough"] else "• "
+            L.append(f"{tag}{fmt_variant(r['v'])}: {r['n']} ciclos · {r['wins']}/{r['n']} ganadores · "
+                     f"media {r['avg']:+.2f}% · total {r['total']:+.2f}%" + ("" if r["enough"] else " (pocos ciclos)"))
+        best = next((r for r in src if r["enough"]), None)
+        if best:
+            L.append(f"• Mejor por ahora: {fmt_variant(best['v'])}. Si es distinta a la que usas, cámbiala en ⚙️ Parámetros.")
+        else:
+            L.append("• Todavía hay pocos ciclos para decidir: espera otra semana.")
 
     recs = recommendations(week, month, cfg)
     if recs:

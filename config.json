@@ -20,7 +20,7 @@
     "move_pct_2h": 0.9,
     "arb_net_pct": 0.3,
     "maker_net_pct": 0.3,
-    "taker_net_pct": 0.2,
+    "taker_net_pct": 1.5,
     "price_above": null,
     "price_below": null,
     "rsi_overbought": 70,
@@ -44,7 +44,8 @@
       "rule",
       "zone",
       "breakout",
-      "maker"
+      "maker",
+      "rebound"
     ],
     "breakout_margin_pct": 0.1,
     "bollinger_min_width_pct": 0.25,

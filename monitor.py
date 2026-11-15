@@ -56,24 +56,45 @@ DEFAULTS = {
     "exact_mode": True,
     "min_usdt_available": 30,
     "max_order_usdt_trivial": 9,
+    "min_liquidity_usdt": 200,       # el precio "ejecutable" es el que tiene al menos estos USDT de respaldo en el libro
+    "outlier_pct": 0.5,              # un anuncio que se aleja más de esto % de los siguientes se descarta como atípico
+    "binance_taker_fee_usdt": 0.07,  # Binance cobra esta tarifa fija (USDT) por orden cuando TOMAS un anuncio
     "maker_rank": 3,
     "history_max": 4000,
     "live_seconds": 420,
     "live_refresh_seconds": 60,
+    "wallet": {"min_profit_pct": 0.5},   # ganancia mínima sobre tu T/C de equilibrio para sugerir vender
+    "rebound": {
+        "drop_pct": 1.0,        # caída mínima (%) dentro de la ventana para hablar de "posible suelo"
+        "confirm_pct": 0.3,     # cuánto debe subir (%) desde el mínimo para confirmar el rebote
+        "window_min": 60,       # ventana (min) en la que se mide la caída
+        "flat_min": 15,         # minutos sin hacer mínimos nuevos para decir que "dejó de bajar"
+        "watch_max_min": 180,   # si no se confirma en este tiempo, se descarta
+        "stall_min": 20,        # minutos sin nuevo máximo (con ganancia) para decir que "dejó de subir"
+        "giveback_pct": 0.3,    # retroceso (%) desde el máximo que también marca el techo
+        "invalid_pct": 0.1,     # cuánto por debajo del mínimo invalida el rebote
+        "hold_max_h": 6,        # tiempo máximo de un ciclo de compra→venta
+        "step_min": 5,          # el precio se lee en velas de estos minutos
+        # prueba en paralelo (solo para el informe semanal, no envía alertas) de otras combinaciones
+        "grid_drop": [0.3, 0.5, 0.75, 1.0],
+        "grid_confirm": [0.2, 0.3, 0.5],
+        "grid_window": [60, 180],
+    },
     "alerts": {
         "move_pct_30m": 0.5,
         "move_pct_2h": 0.9,
         "arb_net_pct": 0.3,
         "maker_net_pct": 0.3,
-        "taker_net_pct": 0.2,
+        "taker_net_pct": 1.5,
         "price_above": None,
         "price_below": None,
         "rsi_overbought": 70,
         "rsi_oversold": 30,
         "cooldown_min": {"move": 45, "arb": 30, "maker": 60, "taker": 30,
                          "signal": 120, "level": 120, "news": 360, "rule": 0,
-                         "zone": 120, "breakout": 120, "bollinger": 180, "daily": 0, "weekly": 0},
-        "repeat_kinds": ["rule", "zone", "breakout", "maker"],  # se repiten para que no pasen desapercibidas
+                         "zone": 120, "breakout": 120, "bollinger": 180, "daily": 0, "weekly": 0,
+                         "rebound": 10, "wallet": 120},
+        "repeat_kinds": ["rule", "zone", "breakout", "maker", "rebound"],  # se repiten para que no pasen desapercibidas
         "breakout_margin_pct": 0.10,     # cuánto debe pasar el piso/techo de 3 días para llamarlo ruptura
         "bollinger_min_width_pct": 0.25, # ancho mínimo de las bandas (si el precio está muy quieto, no avisa)
         "daily_hour": 7,                 # hora local (Bolivia) del resumen diario
@@ -286,6 +307,36 @@ def quality_filter(ads, amount, cfg):
     return ads
 
 
+def usable(ads, amount):
+    """Anuncios donde TU operación cabe: mínimo ≤ monto ≤ máximo (en Bs). Un anuncio que solo acepta una orden
+    exacta de 240.000 Bs (mín = máx) puede tener el mejor precio del libro y ser imposible de usar."""
+    return [a for a in ads if (a.get("min") or 0) <= amount <= (a.get("max") or 1e12)]
+
+
+def drop_outliers(ads, pct):
+    """'ads' va ordenada del mejor al peor precio. Mientras el primero se aleje más de pct% de la mediana de los
+    siguientes 5, se descarta: es un anuncio atípico, no el precio real del mercado."""
+    ads, dropped = list(ads), 0
+    while len(ads) >= 4:
+        ref = statistics.median(a["price"] for a in ads[1:6])
+        if ref and abs(ads[0]["price"] / ref - 1) * 100 > pct:
+            ads.pop(0)
+            dropped += 1
+        else:
+            break
+    return ads, dropped
+
+
+def depth_price(ads, min_usdt):
+    """Precio 'ejecutable': el del anuncio donde, sumando desde el mejor, el libro junta al menos min_usdt USDT."""
+    acc = 0.0
+    for a in ads:
+        acc += a.get("available") or 0
+        if acc >= min_usdt:
+            return a["price"]
+    return ads[-1]["price"]
+
+
 def summarize(buy_ads, sell_ads, cfg, name, source=None):
     amount = cfg["trade_amount_bob"]
     buy = sorted(quality_filter(buy_ads, amount, cfg), key=lambda a: a["price"])
@@ -293,10 +344,22 @@ def summarize(buy_ads, sell_ads, cfg, name, source=None):
     if not buy or not sell:
         raise RuntimeError(f"sin anuncios con ≥{cfg.get('min_usdt_available')} USDT disponibles y límite máx. "
                            f"mayor a {cfg.get('max_order_usdt_trivial')} USDT")
+    # solo anuncios donde cabe tu monto; si quedan muy pocos se usa todo el libro, pero se marca como 'relajado'
+    # (con el libro relajado no se envían alertas de cruce, porque el precio podría no ser ejecutable)
+    fit_buy, fit_sell = usable(buy, amount), usable(sell, amount)
+    relaxed = len(fit_buy) < 3 or len(fit_sell) < 3
+    if not relaxed:
+        buy, sell = fit_buy, fit_sell
+    pct = cfg.get("outlier_pct", 0.5)
+    buy, d1 = drop_outliers(buy, pct)
+    sell, d2 = drop_outliers(sell, pct)
     r = max(1, min(cfg["maker_rank"], len(buy), len(sell)))
     med = lambda ads: statistics.median(a["price"] for a in ads)  # noqa: E731
+    liq = cfg.get("min_liquidity_usdt", 200)
     s = {"name": name, "source": source or name,
          "best_buy": buy[0]["price"], "best_sell": sell[0]["price"],
+         "exec_buy": depth_price(buy, liq), "exec_sell": depth_price(sell, liq),
+         "relaxed": relaxed, "outliers_dropped": d1 + d2,
          "med_buy": med(buy), "med_sell": med(sell),
          "maker_sell_price": buy[r - 1]["price"], "maker_buy_price": sell[r - 1]["price"],
          "vol_buy": round(sum(a["available"] for a in buy), 2),
@@ -305,6 +368,16 @@ def summarize(buy_ads, sell_ads, cfg, name, source=None):
          "top_buy": [slim(a) for a in buy[:5]], "top_sell": [slim(a) for a in sell[:5]]}
     s["ref"] = (s["med_buy"] + s["med_sell"]) / 2
     return s
+
+
+def xb(p):
+    """Precio de compra ejecutable (con el respaldo de USDT pedido); si falta, el mejor del libro."""
+    return p.get("exec_buy", p["best_buy"])
+
+
+def xs(p):
+    """Precio de venta ejecutable."""
+    return p.get("exec_sell", p["best_sell"])
 
 
 def collect_binance(cfg, errors):
@@ -968,16 +1041,28 @@ def build_scenario(ta, news, pressure, weights=None, cat_weight=None):
 
 # ───────────────────────── oportunidades ─────────────────────────
 
+def fee_frac(cfg, plat, price, taker=True):
+    """Comisión como fracción de la operación. En Binance, al TOMAR un anuncio (taker) la tarifa es fija en USDT por
+    orden: se convierte a % según el monto típico. Como maker se usa fee_binance_pct. Bybit: fee_bybit_pct."""
+    if plat == "binance" and taker and cfg.get("binance_taker_fee_usdt") is not None and price:
+        usdt = max(cfg["trade_amount_bob"] / price, 1e-9)
+        return cfg["binance_taker_fee_usdt"] / usdt
+    return cfg[f"fee_{plat}_pct"] / 100
+
+
 def opportunities(platforms, cfg):
-    fee = {"binance": cfg["fee_binance_pct"] / 100, "bybit": cfg["fee_bybit_pct"] / 100}
     cap = cfg["capital_bob"]
     out = {"taker": [], "maker": [], "arbitrage": []}
     for n, p in platforms.items():
-        f = fee[n]
-        g = p["best_sell"] / p["best_buy"] - 1
-        net = p["best_sell"] * (1 - f) / (p["best_buy"] * (1 + f)) - 1
-        out["taker"].append({"platform": n, "buy": p["best_buy"], "sell": p["best_sell"],
+        # cruce directo: se compra y se vende TOMANDO anuncios, con los precios ejecutables (con respaldo de USDT)
+        pb, ps = xb(p), xs(p)
+        ft = fee_frac(cfg, n, pb)
+        g = ps / pb - 1
+        net = ps * (1 - ft) / (pb * (1 + ft)) - 1
+        out["taker"].append({"platform": n, "buy": pb, "sell": ps, "relaxed": bool(p.get("relaxed")),
                              "gross_pct": g * 100, "net_pct": net * 100, "est_bob": net * cap})
+        # spread como maker: publicas tus propios anuncios
+        f = cfg[f"fee_{n}_pct"] / 100
         mg = p["maker_sell_price"] / p["maker_buy_price"] - 1
         mn = p["maker_sell_price"] * (1 - f) / (p["maker_buy_price"] * (1 + f)) - 1
         out["maker"].append({"platform": n, "buy_price": p["maker_buy_price"], "sell_price": p["maker_sell_price"],
@@ -986,8 +1071,11 @@ def opportunities(platforms, cfg):
         tf = cfg["usdt_transfer_fee"] / max(cfg["transfer_size_usdt"], 1)
         for a, b in (("binance", "bybit"), ("bybit", "binance")):
             pa, pb = platforms[a], platforms[b]
-            net0 = pb["best_sell"] * (1 - fee[b]) / (pa["best_buy"] * (1 + fee[a])) - 1
-            out["arbitrage"].append({"buy_on": a, "sell_on": b, "buy": pa["best_buy"], "sell": pb["best_sell"],
+            buy_px, sell_px = xb(pa), xs(pb)
+            fa, fb_ = fee_frac(cfg, a, buy_px), fee_frac(cfg, b, sell_px)
+            net0 = sell_px * (1 - fb_) / (buy_px * (1 + fa)) - 1
+            out["arbitrage"].append({"buy_on": a, "sell_on": b, "buy": buy_px, "sell": sell_px,
+                                     "relaxed": bool(pa.get("relaxed") or pb.get("relaxed")),
                                      "net_pct": net0 * 100, "net_after_transfer_pct": (net0 - tf) * 100,
                                      "est_bob": net0 * cap, "est_bob_after_transfer": (net0 - tf) * cap})
     return out
@@ -1008,6 +1096,312 @@ def build_signals(ta, scen, cfg):
     if scen["label"] == "ALZA" and scen["strong"]:
         sig.append({"type": "cuidado", "text": "Tendencia alcista fuerte: si tienes USDT, podrías esperar antes de vender; si debes comprar, hazlo por tramos."})
     return sig
+
+
+# ───────────────────────── cartera y parámetros ajustables ─────────────────────────
+
+def wallet_get(state):
+    return state.get("wallet") or {}
+
+
+def apply_wallet(cfg, state):
+    """El capital que usan las estimaciones de ganancia sale de tu cartera: Bs + USDT valorados a tu equilibrio."""
+    w = wallet_get(state)
+    if w.get("bs") is None and w.get("usdt") is None:
+        return
+    cfg["capital_usdt"] = w.get("usdt") or 0
+    cfg["capital_bob"] = (w.get("bs") or 0) + (w.get("usdt") or 0) * (w.get("avg_tc") or 0)
+
+
+# (id, etiqueta, unidad, mínimo, máximo): lo que se puede cambiar desde el menú ⚙️ Parámetros
+PARAMS = [
+    ("liq", "Liquidez mínima del precio", "USDT", 10, 5000),
+    ("net", "Neto mínimo del cruce ⚡", "%", 0.05, 20),
+    ("drop", "Rebote: caída mínima", "%", 0.1, 5),
+    ("conf", "Rebote: confirmación (suba desde el mínimo)", "%", 0.05, 2),
+    ("bfee", "Binance taker: tarifa fija por orden", "USDT", 0, 5),
+    ("trade", "Monto típico por operación", "Bs", 100, 1000000),
+]
+
+
+def param_get(cfg, pid):
+    return {"liq": lambda: cfg["min_liquidity_usdt"], "net": lambda: cfg["alerts"]["taker_net_pct"],
+            "drop": lambda: cfg["rebound"]["drop_pct"], "conf": lambda: cfg["rebound"]["confirm_pct"],
+            "bfee": lambda: cfg["binance_taker_fee_usdt"], "trade": lambda: cfg["trade_amount_bob"]}[pid]()
+
+
+def param_set(cfg, pid, v):
+    if pid == "liq":
+        cfg["min_liquidity_usdt"] = v
+    elif pid == "net":
+        cfg["alerts"]["taker_net_pct"] = v
+    elif pid == "drop":
+        cfg["rebound"]["drop_pct"] = v
+    elif pid == "conf":
+        cfg["rebound"]["confirm_pct"] = v
+    elif pid == "bfee":
+        cfg["binance_taker_fee_usdt"] = v
+    elif pid == "trade":
+        cfg["trade_amount_bob"] = v
+    else:
+        raise KeyError(pid)
+
+
+def apply_params(cfg, state):
+    for pid, v in (state.get("params") or {}).items():
+        try:
+            param_set(cfg, pid, v)
+        except KeyError:
+            pass
+
+
+# ───────────────────────── rebote: comprar cuando deja de bajar, vender cuando deja de subir ─────────────────────────
+# Se mide sobre el precio EJECUTABLE de Bybit (con respaldo de USDT), en velas de 5 min, y NO es una predicción:
+# solo avisa cuando el precio ya hizo el giro. Etapas: idle → watch (posible suelo, no comprar) → long (rebote
+# confirmado: comprar) → idle (techo: vender, o invalidado si perfora el mínimo). Varias combinaciones de umbrales
+# corren en paralelo y anotan sus ciclos; solo la combinación principal envía alertas.
+
+def reb_key(drop, conf, win):
+    return f"{drop:g}_{conf:g}_{int(win)}"
+
+
+def reb_variants(rc):
+    main = reb_key(rc["drop_pct"], rc["confirm_pct"], rc["window_min"])
+    combos = [(rc["drop_pct"], rc["confirm_pct"], rc["window_min"])]
+    combos += [(d, c, w) for d in rc.get("grid_drop", []) for c in rc.get("grid_confirm", [])
+               for w in rc.get("grid_window", [])]
+    out, seen = [], set()
+    for d, c, w in combos:
+        k = reb_key(d, c, w)
+        if k in seen:
+            continue
+        seen.add(k)
+        v = dict(rc)
+        v.update(drop_pct=d, confirm_pct=c, window_min=w, key=k, main=(k == main))
+        out.append(v)
+    return out
+
+
+def reb_series(ticks, step_min):
+    """Velas de step_min minutos: (t, compra ejecutable, venta ejecutable) con la última lectura de cada vela."""
+    step, out = step_min * 60, []
+    for t, eb, es in ticks:
+        b = int(t // step)
+        if out and out[-1][0] == b:
+            out[-1] = (b, t, eb, es)
+        else:
+            out.append((b, t, eb, es))
+    return [(t, eb, es) for _, t, eb, es in out]
+
+
+def reb_step(v, rs, ser):
+    """Una vuelta de la máquina de estados de una combinación. 'ser' = velas [(t, compra, venta)]; 'rs' = su estado
+    (se modifica). Devuelve los eventos ocurridos: watch, buy, expire, sell, invalid, timeout."""
+    ev = []
+    if len(ser) < 4:
+        return ev
+    t, p, es = ser[-1]
+    st = rs.get("s", "idle")
+    if st == "idle":
+        if t < rs.get("cool", 0):
+            return ev
+        recent = [x for x in ser if x[0] >= t - v["window_min"] * 60]
+        if len(recent) < 4:
+            return ev
+        ih = max(range(len(recent)), key=lambda i: (recent[i][1], -i))   # el máximo más antiguo de la ventana
+        after = recent[ih:]
+        il = min(range(len(after)), key=lambda i: (after[i][1], i))      # el mínimo posterior (el primero que lo tocó)
+        H, (tL, L) = recent[ih][1], (after[il][0], after[il][1])
+        drop, up = (H - L) / H * 100, (p / L - 1) * 100
+        # cayó lo suficiente, lleva un rato sin hacer mínimos nuevos y todavía no se fue lejos del mínimo
+        if drop >= v["drop_pct"] and t - tL >= v["flat_min"] * 60 and up <= v["confirm_pct"] * 3:
+            rs.clear()
+            rs.update(s="watch", L=L, tL=tL, H=H, t0=t)
+            ev.append({"k": "watch", "t": t, "H": H, "L": L, "drop": drop, "flat_min": (t - tL) / 60})
+            st = "watch"
+        else:
+            return ev
+    if st == "watch":
+        if p < rs["L"]:                       # siguió cayendo: nuevo mínimo, se reinicia la espera
+            rs["L"], rs["tL"] = p, t
+            return ev
+        if t - rs["t0"] > v["watch_max_min"] * 60:
+            rs.clear()
+            rs.update(s="idle", cool=t + 900)
+            ev.append({"k": "expire", "t": t})
+            return ev
+        last = [x[1] for x in ser[-3:]]
+        rising = last[2] >= last[1] >= last[0] and last[2] > last[0]    # 3 lecturas seguidas sin bajar y con alza neta
+        up = (p / rs["L"] - 1) * 100
+        if up >= v["confirm_pct"] and rising:
+            rs.update(s="long", pb=p, tb=t, peak_es=es, tpeak=t)
+            ev.append({"k": "buy", "t": t, "eb": p, "L": rs["L"], "tL": rs["tL"], "up": up})
+        return ev
+    if st == "long":
+        # Se compró en 'pb' (precio de compra). Vender se valora con el precio de VENTA real ('es'), que suele ser
+        # menor: el pico, el retroceso y el resultado salen de ahí, para no avisar "vende" con pérdida.
+        pb = rs["pb"]
+        if es > rs.get("peak_es", 0):
+            rs["peak_es"], rs["tpeak"] = es, t
+        peak = rs["peak_es"]
+        gain, pullback = (peak / pb - 1) * 100, (peak - es) / peak * 100
+        stalled = (t - rs["tpeak"]) / 60
+        why = None
+        if p <= rs["L"] * (1 - v["invalid_pct"] / 100):
+            why = "invalid"                    # el precio perforó el mínimo: el rebote falló
+        elif (gain >= v["confirm_pct"] and es > pb
+              and (pullback >= v["giveback_pct"] or stalled >= v["stall_min"])):
+            why = "sell"                       # subió, dejó de subir (o retrocedió) y aún hay ganancia: techo
+        elif t - rs["tb"] > v["hold_max_h"] * 3600:
+            why = "timeout"
+        if why:
+            ev.append({"k": why, "t": t, "tb": rs["tb"], "pb": pb, "ps": es, "pct": (es / pb - 1) * 100,
+                       "peak": peak, "gain": gain, "pullback": pullback, "stalled": stalled, "L": rs["L"]})
+            rs.clear()
+            rs.update(s="idle", cool=t + 1800)
+    return ev
+
+
+def record_tick(state, now, platforms):
+    """Guarda el precio ejecutable de Bybit (compra y venta) cada ~minuto; se conservan 6 h."""
+    p = platforms.get("bybit")
+    if not p or p.get("relaxed"):
+        return False
+    t = int(now.timestamp())
+    ticks = state.setdefault("ticks", [])
+    if ticks and t - ticks[-1][0] < 40:
+        return False
+    ticks.append([t, xb(p), xs(p)])
+    cut = t - 6 * 3600
+    while ticks and ticks[0][0] < cut:
+        ticks.pop(0)
+    return True
+
+
+def seed_ticks(state, hist, now):
+    """Primer arranque: reconstruye las últimas horas desde el historial para no esperar 3 h de datos."""
+    if state.get("ticks"):
+        return
+    cut = now.timestamp() - 6 * 3600
+    out = []
+    for r in hist:
+        # solo lecturas con precios ejecutables (yeb/yes), comparables con los que se guardan en vivo
+        if r.get("yeb") and r.get("yes") and not r.get("seed"):
+            t = parse_iso(r["t"]).timestamp()
+            if t >= cut:
+                out.append([int(t), r["yeb"], r["yes"]])
+    state["ticks"] = out
+
+
+def reb_wallet_line(cfg, state, kind, price):
+    """Línea sobre tu cartera para los avisos de rebote (vacía si aún no cargas tu T/C de equilibrio)."""
+    w = wallet_get(state)
+    avg, usdt = w.get("avg_tc"), w.get("usdt") or 0
+    if not avg:
+        return ""
+    if kind == "buy":
+        bs = cfg["trade_amount_bob"] if w.get("bs") is None else min(w["bs"], cfg["trade_amount_bob"])
+        if bs <= 0:
+            return ""
+        q = bs / price
+        new = (usdt * avg + q * price) / (usdt + q) if usdt > 0 else price
+        return (f"\n💼 Con {bs:,.0f} Bs comprarías ≈ {q:.1f} USDT y tu T/C de equilibrio pasaría de "
+                f"{avg:.3f} a {new:.3f}.")
+    if usdt <= 0:
+        return ""
+    return (f"\n💼 Contra tu T/C de equilibrio ({avg:.3f}): {(price / avg - 1) * 100:+.2f}% "
+            f"(≈ Bs {usdt * (price - avg):+,.0f} si vendes tus {usdt:g} USDT).")
+
+
+def reb_alert(al, cfg, state, e, fb):
+    """Convierte un evento de la combinación principal en aviso de Telegram y lo anota para el informe."""
+    rc, liq, trade = cfg["rebound"], cfg.get("min_liquidity_usdt", 200), cfg["trade_amount_bob"]
+    warn = state.get("reb_warn") or ""
+    if e["k"] == "watch":
+        al.fire("rebound:watch", "rebound",
+                f"👀 POSIBLE SUELO en Bybit: el USDT cayó {e['drop']:.2f}% ({e['H']:.3f} → {e['L']:.3f}) y lleva "
+                f"{e['flat_min']:.0f} min sin hacer mínimos nuevos.\nNo compres todavía: espero que suba al menos "
+                f"{rc['confirm_pct']:g}% desde {e['L']:.3f} para confirmar el rebote.", cd_min=30, repeat=False)
+    elif e["k"] == "buy":
+        text = (f"🟢 REBOTE CONFIRMADO en Bybit → buen momento de COMPRAR\n"
+                f"Dejó de caer en {e['L']:.3f} y ya subió {e['up']:+.2f}% con lecturas seguidas al alza.\n"
+                f"Compra ≈ {e['eb']:.3f} (precio con ≥{liq:g} USDT de respaldo).\n"
+                f"Si vuelve a caer bajo {e['L']:.3f} te aviso que se invalidó; cuando deje de subir te aviso para vender."
+                + reb_wallet_line(cfg, state, "buy", e["eb"]) + (f"\n{warn}" if warn else ""))
+        if al.fire("rebound:buy", "rebound", text) and fb is not None and FB:
+            FB.log_event(fb, al.now, "rebote_compra", e["eb"])
+    elif e["k"] == "sell":
+        how = (f"ya retrocedió {e['pullback']:.2f}%" if e["pullback"] >= rc["giveback_pct"]
+               else f"lleva {e['stalled']:.0f} min sin hacer máximos nuevos")
+        text = (f"🔴 TECHO en Bybit → buen momento de VENDER\n"
+                f"Subió hasta {e['peak']:.3f} ({e['gain']:+.2f}% desde la compra del rebote) y {how}.\n"
+                f"Vendes ≈ {e['ps']:.3f}. Resultado del ciclo: {e['pct']:+.2f}% "
+                f"(≈ Bs {e['pct'] / 100 * trade:+,.0f} por {trade:,.0f} Bs)."
+                + reb_wallet_line(cfg, state, "sell", e["ps"]))
+        if al.fire("rebound:sell", "rebound", text) and fb is not None and FB:
+            FB.log_event(fb, al.now, "rebote_techo", e["ps"])
+    elif e["k"] == "invalid":
+        al.fire("rebound:invalid", "rebound",
+                f"⚠️ REBOTE INVALIDADO en Bybit: volvió a caer bajo {e['L']:.3f} (ahora ≈ {e['ps']:.3f}).\n"
+                f"Si compraste en {e['pb']:.3f} con la señal, el resultado ahora sería {e['pct']:+.2f}%. "
+                "Evita comprar más hasta que se estabilice.")
+
+
+def run_rebound(al, cfg, state, fb):
+    """Corre todas las combinaciones sobre las velas guardadas. Solo la principal avisa; todas anotan ciclos."""
+    rc = cfg["rebound"]
+    ser = reb_series(state.get("ticks") or [], rc["step_min"])
+    if len(ser) < 4:
+        return
+    store = state.setdefault("rebound", {})
+    variants = reb_variants(rc)
+    keys = {v["key"] for v in variants}
+    for k in [k for k in store if k not in keys]:
+        rs = store[k]
+        if rs.get("s") in ("watch", "long") and rs.get("m"):
+            # cambiaste los parámetros con un ciclo principal abierto: sigue vivo (y avisando) hasta cerrarlo
+            try:
+                d, c, w = (float(x) for x in k.split("_"))
+            except ValueError:
+                del store[k]
+                continue
+            v = dict(rc)
+            v.update(drop_pct=d, confirm_pct=c, window_min=w, key=k, main=True)
+            variants.append(v)
+        else:
+            del store[k]
+    for v in variants:
+        rs = store.setdefault(v["key"], {})
+        prev_open = rs.get("s", "idle") != "idle"
+        keep = bool(rs.get("m")) and prev_open and not v["main"]   # ciclo abierto cuando era la principal
+        evs = reb_step(v, rs, ser)
+        rs["m"] = v["main"] or (keep and rs.get("s", "idle") != "idle")
+        for e in evs:
+            if e["k"] in ("sell", "invalid", "timeout") and fb is not None and FB:
+                FB.log_cycle(fb, {"v": v["key"], "tb": iso(datetime.fromtimestamp(e["tb"], timezone.utc)),
+                                  "pb": round(e["pb"], 4), "ts": iso(datetime.fromtimestamp(e["t"], timezone.utc)),
+                                  "ps": round(e["ps"], 4), "pct": round(e["pct"], 3),
+                                  "why": {"sell": "techo", "invalid": "invalida", "timeout": "tiempo"}[e["k"]]})
+            if v["main"] or keep:
+                reb_alert(al, cfg, state, e, fb)
+
+
+def evaluate_wallet(al, cfg, state, platforms):
+    """Avisa (una vez por cruce) cuando Bybit paga por tu USDT más que tu T/C de equilibrio + ganancia mínima."""
+    w, p = wallet_get(state), platforms.get("bybit")
+    avg, usdt = w.get("avg_tc"), w.get("usdt") or 0
+    if not avg or usdt <= 0 or not p or p.get("relaxed"):
+        return
+    es, need = xs(p), avg * (1 + cfg["wallet"]["min_profit_pct"] / 100)
+    if es < need:
+        state["wallet_on"] = False
+        return
+    if not state.get("wallet_on") and al.fire(
+            "wallet:sell", "wallet",
+            f"💼 Puedes vender con ganancia: Bybit paga ≈ {es:.3f} y tu T/C de equilibrio es {avg:.3f} "
+            f"→ {(es / avg - 1) * 100:+.2f}% (≈ Bs {usdt * (es - avg):+,.0f} si vendes tus {usdt:g} USDT).\n"
+            "Si el precio sigue subiendo, espera el aviso de TECHO para vender más arriba."):
+        state["wallet_on"] = True
 
 
 # ───────────────────────── alertas ─────────────────────────
@@ -1049,7 +1443,7 @@ class Alerter:
     def muted(self):
         return self.now.timestamp() < self.state.get("muted_until", 0)
 
-    def fire(self, key, kind, text, cd_min=None, ev=None):
+    def fire(self, key, kind, text, cd_min=None, ev=None, repeat=True):
         if kind in self.state.get("auto_off", []) or self.muted():
             return False
         cd = (self.cfg["alerts"]["cooldown_min"].get(kind, 60) if cd_min is None else cd_min) * 60
@@ -1064,7 +1458,7 @@ class Alerter:
             self.events.append(ev)
         a = self.cfg["alerts"]
         n, gap = int(a.get("repeat_times") or 1), float(a.get("repeat_seconds") or 15)
-        if kind in a.get("repeat_kinds", []) and n > 1:
+        if repeat and kind in a.get("repeat_kinds", []) and n > 1:
             for i in range(2, n + 1):
                 self.queue.append([time.time() + gap * (i - 1), f"🔁 Alerta repetida {i}/{n}\n{text}"])
         return True
@@ -1072,17 +1466,26 @@ class Alerter:
 
 def evaluate_opp_alerts(al, cfg, opps):
     a = cfg["alerts"]
+    liq = cfg.get("min_liquidity_usdt", 200)
+    on = al.state.setdefault("opp_on", {})
     for o in opps["arbitrage"]:
-        if o["net_pct"] >= a["arb_net_pct"]:
+        if o["net_pct"] >= a["arb_net_pct"] and not o.get("relaxed"):
             al.fire(f"arb:{o['buy_on']}", "arb",
                     f"💱 ARBITRAJE: compra en {o['buy_on'].title()} a {px(o['buy'], o['buy_on'])} y vende en {o['sell_on'].title()} a {px(o['sell'], o['sell_on'])}\n"
                     f"Neto {o['net_pct']:+.2f}% (≈ Bs {o['est_bob']:+,.0f} con tu capital; "
                     f"{o['net_after_transfer_pct']:+.2f}% si mueves USDT por la red).")
     for o in opps["taker"]:
-        if o["net_pct"] >= a["taker_net_pct"]:
-            al.fire(f"taker:{o['platform']}", "taker",
-                    f"⚡ {o['platform'].title()}: compra {px(o['buy'], o['platform'])} / vende {px(o['sell'], o['platform'])} → neto {o['net_pct']:+.2f}% "
-                    f"(≈ Bs {o['est_bob']:+,.0f}). Ejecuta rápido, estos cruces duran poco.")
+        k = f"taker:{o['platform']}"
+        # solo avisa cuando el cruce APARECE (no mientras sigue ahí) y nunca con un libro 'relajado' (precio dudoso)
+        if o["net_pct"] < a["taker_net_pct"] or o.get("relaxed"):
+            on[k] = False
+            continue
+        if not on.get(k) and al.fire(
+                k, "taker",
+                f"⚡ {o['platform'].title()}: compra {px(o['buy'], o['platform'])} / vende {px(o['sell'], o['platform'])} "
+                f"(precios con ≥{liq:g} USDT de respaldo) → neto {o['net_pct']:+.2f}% "
+                f"(≈ Bs {o['est_bob']:+,.0f}). Ejecuta rápido, estos cruces duran poco."):
+            on[k] = True
     for o in opps["maker"]:
         if o["net_pct"] >= a["maker_net_pct"]:
             al.fire(f"maker:{o['platform']}", "maker",
@@ -1328,21 +1731,24 @@ DOWN_WORDS_CMD = {"baja", "bajar", "bajo", "abajo", "menor", "debajo", "cae", "c
 AUTO = {"move": "Movimiento del precio", "arb": "Arbitraje Binance↔Bybit", "taker": "Cruce directo",
         "maker": "Spread como maker", "signal": "Cambio de escenario", "news": "Noticias de impacto",
         "zone": "Zona de compra/venta (RSI)", "breakout": "Ruptura de soporte/resistencia",
-        "bollinger": "Bandas de Bollinger", "daily": "Resumen diario", "weekly": "Informe semanal de aciertos"}
+        "bollinger": "Bandas de Bollinger", "daily": "Resumen diario", "weekly": "Informe semanal de aciertos",
+        "rebound": "Rebote en Bybit (comprar/vender)", "wallet": "Mi cartera: vender con ganancia"}
 AUTO_SHORT = {"move": "Movimiento", "arb": "Arbitraje", "taker": "Cruce", "maker": "Maker",
               "signal": "Escenario", "news": "Noticias", "zone": "Zonas", "breakout": "Rupturas",
-              "bollinger": "Bollinger", "daily": "Diario", "weekly": "Semanal"}
+              "bollinger": "Bollinger", "daily": "Diario", "weekly": "Semanal", "rebound": "Rebote",
+              "wallet": "Cartera"}
 AUTO_ALIASES = {"movimiento": "move", "mov": "move", "arbitraje": "arb", "cruce": "taker", "taker": "taker",
                 "maker": "maker", "senales": "signal", "senal": "signal", "escenario": "signal", "noticias": "news",
                 "noticia": "news", "zona": "zone", "zonas": "zone", "ruptura": "breakout", "rupturas": "breakout",
                 "bollinger": "bollinger", "diario": "daily", "resumen": "daily", "semanal": "weekly",
-                "semana": "weekly", "informe": "weekly"}
+                "semana": "weekly", "informe": "weekly", "rebote": "rebound", "cartera": "wallet"}
 FOREVER = 4102444800  # año 2100: "pausa hasta que yo la reanude"
 MAX_RULES = 20
-UI_VERSION = 3
+UI_VERSION = 4
 
 BOT_COMMANDS = [
     ("menu", "Menú principal"), ("precios", "Precios y spread Binance/Bybit"), ("alertas", "Mis alertas activas"),
+    ("cartera", "Mi cartera: Bs, USDT y T/C de equilibrio"), ("parametros", "Liquidez, neto mínimo y rebote"),
     ("nueva", "Crear una alerta con botones"), ("compra", "Alerta de precio de compra"),
     ("venta", "Alerta de precio de venta"), ("spread", "Ver spread o crear alerta de spread"),
     ("desactivar", "Desactivar una alerta o todas"), ("activar", "Activar una alerta o todas"),
@@ -1353,8 +1759,10 @@ BOT_COMMANDS = [
 COMMAND_WORDS = {"compra", "venta", "spread", "desactivar", "activar", "borrar", "quitar", "eliminar", "pausar",
                  "reanudar", "mov", "precios", "precio", "alertas", "alerta", "menu", "ayuda", "help", "estado",
                  "noticias", "oportunidades", "nueva", "start", "analisis", "apagar", "encender", "semana",
-                 "informe", "aciertos"}
+                 "informe", "aciertos", "cartera", "bs", "usdt", "equilibrio", "tc", "compre", "vendi",
+                 "parametros", "ajustes"}
 KEYWORDS = [("aciertos", "semana"), ("informe semanal", "semana"), ("analisis mercado p2p", "estado"), ("mis alertas", "alertas"), ("nueva alerta", "nueva"),
+            ("cartera", "cartera"), ("parametros", "parametros"), ("ajustes", "parametros"),
             ("precios", "precios"), ("noticias", "noticias"), ("oportunidades", "oportunidades"),
             ("reanudar", "reanudar"), ("pausar", "pausar"), ("analisis", "estado")]
 
@@ -1378,6 +1786,12 @@ HELP_TEXT = (
     "/desactivar movimiento (también: arbitraje, cruce, maker, escenario, zonas, rupturas, bollinger, diario, semanal, noticias)\n"
     "/pausar 2h · /reanudar\n"
     "/mov 0.3 → sensibilidad del aviso de movimiento (% en 30 min)\n\n"
+    "Mi cartera\n"
+    "/cartera → tus Bs, USDT y T/C de equilibrio, con sugerencias y ganancia estimada\n"
+    "/bs 15000 · /usdt 300 · /equilibrio 11.95 → actualizar cada dato\n"
+    "/compré 250 11.95 → registra una compra (USDT y precio) y recalcula tu equilibrio\n"
+    "/vendí 250 12.05 → registra una venta y te dice la ganancia\n"
+    "/parametros → liquidez mínima, neto mínimo del cruce ⚡, umbrales del rebote, tarifa de Binance\n\n"
     "Compra = lo que pagas por cada USDT. Venta = lo que recibes por cada USDT. "
     "Spread = (compra ÷ venta − 1) en %."
 )
@@ -1393,10 +1807,12 @@ def ikb(*rows):
 
 HOME = btn("🏠 Menú", "m")
 MAIN_KB = ikb([btn("💱 Precios y spread", "p"), btn("🔔 Mis alertas", "l")],
+              [btn("💼 Mi cartera", "w"), btn("⚙️ Parámetros", "pr")],
               [btn("➕ Nueva alerta", "n"), btn("⏸ Pausar", "z")],
               [btn("📊 Análisis", "an"), btn("📰 Noticias", "nw")],
               [btn("🎯 Aciertos del sistema", "wk")])
 REPLY_KB = {"keyboard": [[{"text": "💱 Precios"}, {"text": "🔔 Mis alertas"}],
+                         [{"text": "💼 Cartera"}, {"text": "⚙️ Parámetros"}],
                          [{"text": "➕ Nueva alerta"}, {"text": "⏸ Pausar"}],
                          [{"text": "📊 Análisis"}, {"text": "📰 Noticias"}]],
             "resize_keyboard": True, "is_persistent": True}
@@ -1490,12 +1906,71 @@ def prices_text(platforms, cfg, ts, stale=False):
               f"  Compra: {px(p['best_buy'], n)}   Venta: {px(p['best_sell'], n)}",
               f"  Spread: {spread_pct(p):+.2f}% (Bs {p['best_buy'] - p['best_sell']:+.3f})",
               f"  Neto tras comisión si publicas tus anuncios: {maker_net_pct(p, f) * 100:+.2f}%"]
+        if (xb(p), xs(p)) != (p["best_buy"], p["best_sell"]):
+            L.append(f"  Con ≥{cfg.get('min_liquidity_usdt', 200):g} USDT de respaldo: "
+                     f"compra {px(xb(p), n)} · venta {px(xs(p), n)}")
+        if p.get("relaxed"):
+            L.append(f"  ⚠️ Pocos anuncios donde cabe tu monto ({cfg['trade_amount_bob']:,.0f} Bs): precios menos fiables")
     arb = opportunities(platforms, cfg)["arbitrage"]
     if arb:
         L += ["", "Entre plataformas (neto de comisión)"]
         for a in arb:
             L.append(f"  {PLAT[a['buy_on']]} → {PLAT[a['sell_on']]}: {a['net_pct']:+.2f}% (≈ Bs {a['est_bob']:+,.0f})")
     return "\n".join(L)
+
+
+def wallet_text(cfg, state, platforms):
+    """Pantalla de la cartera: tus saldos, tu T/C de equilibrio, y cuándo comprar/vender con cuánta ganancia."""
+    w = wallet_get(state)
+    bs, usdt, avg = w.get("bs"), w.get("usdt"), w.get("avg_tc")
+    L = ["💼 Mi cartera"]
+    if bs is None and usdt is None and not avg:
+        return "\n".join(L + ["Aún no la has cargado. Con tus datos te sugiero cuándo comprar o vender y cuánto ganarías.",
+                              "Toca ✏️ Bs, ✏️ USDT y ✏️ T/C equilibrio (tu promedio ponderado de compras de USDT)."])
+    L.append(f"Bs: {bs or 0:,.2f} · USDT: {usdt or 0:,.2f}")
+    L.append(f"T/C de equilibrio: {avg:.3f}" if avg else
+             "T/C de equilibrio: sin cargar (toca ✏️ T/C equilibrio: tu promedio ponderado de compras)")
+    p = (platforms or {}).get("bybit")
+    if not p:
+        return "\n".join(L + ["", "Sin precios de Bybit ahora; vuelve a intentar en un minuto."])
+    liq, eb, es = cfg.get("min_liquidity_usdt", 200), xb(p), xs(p)
+    L += ["", f"Bybit ahora (con ≥{liq:g} USDT de respaldo): compras a {eb:.3f} · vendes a {es:.3f}"]
+    if avg and usdt:
+        gain = usdt * (es - avg)
+        L.append(f"Si vendes hoy tus {usdt:g} USDT: {(es / avg - 1) * 100:+.2f}% → Bs {gain:+,.2f}"
+                 + ("" if gain > 0 else "  (todavía bajo tu equilibrio)"))
+        minp = cfg["wallet"]["min_profit_pct"]
+        L.append(f"Te sugiero vender desde {avg * (1 + minp / 100):.3f} (equilibrio +{minp:g}%). Objetivos:")
+        for m in (0.5, 1.0, 1.5):
+            price = avg * (1 + m / 100)
+            L.append(f"  • {price:.3f} (+{m:g}%) → ganas Bs {usdt * (price - avg):+,.0f}")
+    elif avg:
+        L.append("Sin USDT cargados: toca ✏️ USDT para estimar cuánto ganarías al vender.")
+    if bs and eb:
+        amt = min(bs, cfg["trade_amount_bob"])
+        q = amt / eb
+        if avg and usdt:
+            new = (usdt * avg + q * eb) / (usdt + q)
+            L.append(f"Si compras {amt:,.0f} Bs ahora → ≈ {q:.1f} USDT y tu equilibrio pasa de {avg:.3f} a "
+                     f"{new:.3f} ({new - avg:+.3f}).")
+        else:
+            L.append(f"Con {amt:,.0f} Bs comprarías ≈ {q:.1f} USDT a {eb:.3f}.")
+    rc = cfg["rebound"]
+    rs = (state.get("rebound") or {}).get(reb_key(rc["drop_pct"], rc["confirm_pct"], rc["window_min"])) or {}
+    s = rs.get("s", "idle")
+    L.append("")
+    if s == "watch":
+        L.append(f"👀 Rebote: posible suelo en {rs['L']:.3f}. Espera la confirmación antes de comprar.")
+    elif s == "long":
+        L.append(f"🟢 Rebote confirmado (compra ≈ {rs['pb']:.3f}). Espera el aviso de TECHO para vender.")
+    else:
+        L.append("Rebote: sin señal ahora. Te aviso cuándo es buen momento de comprar (REBOTE CONFIRMADO) "
+                 "y de vender (TECHO).")
+    return "\n".join(L)
+
+
+PARAM_SHORT = {"liq": "Liquidez", "net": "Neto cruce ⚡", "drop": "Rebote: caída", "conf": "Rebote: confirma",
+               "bfee": "Tarifa Binance", "trade": "Monto por operación"}
 
 
 class Bot:
@@ -1558,7 +2033,14 @@ class Bot:
         if not parts:
             return
         pend = self.state.get("pending")
-        if pend and not t.startswith("/") and parse_float(t) is not None:
+        if pend and pend.get("kind"):
+            # esperando un valor de cartera/parámetro: si el mensaje es un comando o un botón del teclado, se
+            # abandona la espera y sigue el flujo normal; si es un valor inválido, se vuelve a pedir (no se borra)
+            is_cmd = t.startswith("/") or parts[0] in COMMAND_WORDS or any(k in t for k, _ in KEYWORDS)
+            if not is_cmd:
+                return self.pending_input(pend, t)
+            self.state["pending"] = None
+        if pend and not pend.get("kind") and not t.startswith("/") and parse_float(t) is not None:
             self.state["pending"] = None
             return self.add_rules(pend["t"], PLAT_CODES[pend["p"]], pend.get("d"), parse_float(t))
         if t.startswith("/"):
@@ -1578,9 +2060,14 @@ class Bot:
              "estado": lambda: self.report("full"), "analisis": lambda: self.report("full"),
              "oportunidades": lambda: self.report("opps"), "noticias": lambda: self.report("news"),
              "reanudar": self.resume, "semana": self.weekly_report, "informe": self.weekly_report,
-             "aciertos": self.weekly_report}.get(cmd)
+             "aciertos": self.weekly_report, "cartera": self.wallet_screen, "parametros": self.params_screen,
+             "ajustes": self.params_screen}.get(cmd)
         if h:
             return h()
+        if cmd in ("bs", "usdt", "equilibrio", "tc"):
+            return self.cmd_wallet_set({"tc": "tc", "equilibrio": "tc"}.get(cmd, cmd), args)
+        if cmd in ("compre", "vendi"):
+            return self.wallet_input("buy" if cmd == "compre" else "sell", " ".join(args), from_cmd=True)
         if cmd in ("compra", "venta"):
             return self.cmd_price(cmd, args)
         if cmd == "spread":
@@ -1724,8 +2211,11 @@ class Bot:
     def menu(self, start=False, edit=None):
         n = sum(1 for r in self.state["rules"] if r.get("active", True))
         if start:
-            self.tg.send("👋 Menú actualizado: nuevas alertas (rupturas, Bollinger, resumen diario) y el informe de aciertos /semana.\n"
+            self.tg.send("👋 Menú actualizado: precios de Bybit corregidos (solo anuncios donde cabe tu monto, con respaldo "
+                         "de USDT), alerta de REBOTE (comprar cuando deja de bajar, vender cuando deja de subir), "
+                         "💼 Mi cartera con tu T/C de equilibrio y ⚙️ Parámetros.\n"
                          "Usa los botones de abajo, o escribe «/» para ver todos los comandos.", REPLY_KB)
+        self.state["pending"] = None
         txt = "🤖 Monitor P2P USDT/BOB\n"
         txt += "🔇 Alertas en pausa\n" if self.muted() else ""
         txt += f"Tienes {n} alerta(s) tuya(s) activa(s).\n¿Qué quieres hacer?"
@@ -1749,6 +2239,122 @@ class Bot:
         fn = self.ctx.get("weekly")
         self.tg.send(fn() if fn else "Informe no disponible.", ikb([HOME]), edit)
 
+    # ── cartera y parámetros ─────────────────────────────────────────
+
+    WALLET_PROMPTS = {
+        "bs": "¿Cuántos Bs tienes disponibles? Escribe solo el número (ej. 15000).",
+        "usdt": "¿Cuántos USDT tienes? Escribe solo el número (ej. 300).",
+        "tc": "¿Cuál es tu T/C de equilibrio (promedio ponderado de tus compras de USDT)? Escribe solo el número (ej. 11.95).",
+        "buy": "Escribe la compra: USDT y precio, ej. «250 11.95».\nDescuenta Bs, suma USDT y recalcula tu equilibrio.",
+        "sell": "Escribe la venta: USDT y precio, ej. «250 12.05».\nSuma Bs, descuenta USDT y te dice la ganancia.",
+    }
+
+    def wallet_screen(self, edit=None):
+        self.state["pending"] = None
+        platforms, _ts, _stale = self.ctx["refresh"]()
+        kb = ikb([btn("✏️ Bs", "w:bs"), btn("✏️ USDT", "w:usdt"), btn("✏️ T/C equilibrio", "w:tc")],
+                 [btn("🟢 Registré una compra", "w:buy"), btn("🔴 Registré una venta", "w:sell")],
+                 [btn("🔄 Actualizar", "w"), HOME])
+        self.tg.send(wallet_text(self.cfg, self.state, platforms), kb, edit)
+
+    def wallet_prompt(self, field, edit=None):
+        if field not in self.WALLET_PROMPTS:
+            return self.wallet_screen(edit)
+        self.state["pending"] = {"kind": "wallet", "f": field}
+        self.tg.send("💼 " + self.WALLET_PROMPTS[field], ikb([btn("⬅️ Cancelar", "w"), HOME]), edit)
+
+    def cmd_wallet_set(self, field, args):
+        if not args:
+            return self.tg.send(self.WALLET_PROMPTS[field].replace("Escribe solo el número", "Ejemplo")
+                                + f"\nUso: /{ {'tc': 'equilibrio'}.get(field, field) } 11.95", ikb([HOME]))
+        self.wallet_input(field, args[0], from_cmd=True)
+
+    def pending_input(self, pend, text):
+        if pend["kind"] == "wallet":
+            return self.wallet_input(pend["f"], text)
+        if pend["kind"] == "param":
+            return self.param_input(pend["f"], text)
+
+    def wallet_input(self, field, text, from_cmd=False):
+        kb = ikb([btn("💼 Mi cartera", "w"), HOME])
+        nums = [parse_float(x) for x in text.replace(";", " ").split()]
+        need = 2 if field in ("buy", "sell") else 1
+        if len(nums) != need or any(v is None or v < 0 for v in nums) or (need == 2 and 0 in nums):
+            return self.tg.send("No entendí ese valor. " + ("Escribe dos números: USDT y precio (ej. 250 11.95)."
+                                                           if need == 2 else "Escribe solo un número (ej. 15000)."), kb)
+        w = self.state.setdefault("wallet", {})
+        if field in ("bs", "usdt"):
+            w[field] = round(nums[0], 2)
+            msg = f"✅ {'Bs' if field == 'bs' else 'USDT'} actualizados: {nums[0]:,.2f}"
+        elif field == "tc":
+            if not 1 <= nums[0] <= 100:
+                return self.tg.send("Ese T/C no parece válido (ej. 11.95).", kb)
+            w["avg_tc"] = round(nums[0], 4)
+            msg = f"✅ T/C de equilibrio actualizado: {nums[0]:.3f}"
+        elif field == "buy":
+            q, price = nums
+            old, avg = w.get("usdt") or 0, w.get("avg_tc")
+            w["avg_tc"] = round((old * avg + q * price) / (old + q), 4) if old > 0 and avg else round(price, 4)
+            w["usdt"] = round(old + q, 2)
+            note = ""
+            if w.get("bs") is not None:
+                if w["bs"] < q * price:
+                    note = "\n⚠️ Tus Bs no alcanzaban para esa compra: quedaron en 0; corrígelos con /bs."
+                w["bs"] = round(max(0.0, w["bs"] - q * price), 2)
+            msg = (f"✅ Compra registrada: {q:g} USDT a {price:.3f} (Bs {q * price:,.2f}).\n"
+                   f"Nuevo T/C de equilibrio: {w['avg_tc']:.3f} · USDT: {w['usdt']:,.2f}"
+                   + (f" · Bs: {w['bs']:,.2f}" if w.get("bs") is not None else "") + note)
+        else:  # sell
+            q, price = nums
+            old, avg = w.get("usdt") or 0, w.get("avg_tc")
+            if q > old + 1e-9:
+                return self.tg.send(f"Dices vender {q:g} USDT pero tu cartera tiene {old:g}. "
+                                    "Corrige el saldo con /usdt o escribe otra cantidad.", kb)
+            w["usdt"] = round(old - q, 2)
+            w["bs"] = round((w.get("bs") or 0) + q * price, 2)
+            msg = f"✅ Venta registrada: {q:g} USDT a {price:.3f} (Bs {q * price:,.2f})."
+            if avg:
+                msg += (f"\nGanancia frente a tu equilibrio ({avg:.3f}): Bs {q * (price - avg):+,.2f} "
+                        f"({(price / avg - 1) * 100:+.2f}%)")
+            msg += f"\nUSDT: {w['usdt']:,.2f} · Bs: {w['bs']:,.2f}"
+        apply_wallet(self.cfg, self.state)
+        self.state["pending"] = None
+        self.tg.send(msg, kb)
+
+    def params_screen(self, edit=None):
+        self.state["pending"] = None
+        L = ["⚙️ Parámetros (toca uno para cambiarlo)", ""]
+        btns = []
+        for pid, label, unit, _lo, _hi in PARAMS:
+            v = param_get(self.cfg, pid)
+            L.append(f"• {label}: {v:g} {unit}")
+            btns.append(btn(f"✏️ {PARAM_SHORT[pid]}: {v:g}", f"pr:{pid}"))
+        L += ["", "Cada sábado el informe compara varias combinaciones de rebote (caída 0.3–1%, confirmación 0.2–0.5%) "
+                  "y te dice cuál rindió mejor; con eso decides si cambias estos valores."]
+        rows = [btns[i:i + 2] for i in range(0, len(btns), 2)] + [[HOME]]
+        self.tg.send("\n".join(L), ikb(*rows), edit)
+
+    def param_prompt(self, pid, edit=None):
+        spec = next((p for p in PARAMS if p[0] == pid), None)
+        if not spec:
+            return self.params_screen(edit)
+        _, label, unit, lo, hi = spec
+        self.state["pending"] = {"kind": "param", "f": pid}
+        self.tg.send(f"⚙️ {label}\nAhora: {param_get(self.cfg, pid):g} {unit}\n"
+                     f"Escribe el nuevo valor (entre {lo:g} y {hi:g}).", ikb([btn("⬅️ Cancelar", "pr"), HOME]), edit)
+
+    def param_input(self, pid, text):
+        spec = next((p for p in PARAMS if p[0] == pid), None)
+        v = parse_float(text)
+        kb = ikb([btn("⚙️ Parámetros", "pr"), HOME])
+        if not spec or v is None or not (spec[3] <= v <= spec[4]):
+            return self.tg.send(f"Valor no válido. Debe estar entre {spec[3]:g} y {spec[4]:g}." if spec
+                                else "Parámetro desconocido.", kb)
+        self.state.setdefault("params", {})[pid] = v
+        self.state["pending"] = None
+        param_set(self.cfg, pid, v)
+        self.tg.send(f"✅ {spec[1]}: {v:g} {spec[2]}\nSe aplica desde la próxima lectura de precios (≈ 1 minuto).", kb)
+
     def show_alerts(self, edit=None):
         st, a = self.state, self.cfg["alerts"]
         mu = st.get("muted_until", 0)
@@ -1770,7 +2376,9 @@ class Bot:
                   "zone": f"(RSI ≥{a['rsi_overbought']} / ≤{a['rsi_oversold']} cerca del techo / piso)",
                   "breakout": f"(>{a['breakout_margin_pct']:g}% fuera del rango de 3 días)",
                   "bollinger": "(precio en la banda de 20 h)",
-                  "daily": f"(cada día {a['daily_hour']}:00)", "weekly": "(sábados)"}
+                  "daily": f"(cada día {a['daily_hour']}:00)", "weekly": "(sábados)",
+                  "rebound": f"(caída ≥{self.cfg['rebound']['drop_pct']:g}% · confirma +{self.cfg['rebound']['confirm_pct']:g}%)",
+                  "wallet": f"(≥{self.cfg['wallet']['min_profit_pct']:g}% sobre tu equilibrio)"}
         L += ["", "Automáticas:"]
         for k, name in AUTO.items():
             rp = f" ×{a['repeat_times']}" if k in a.get("repeat_kinds", []) else ""
@@ -1922,6 +2530,10 @@ class Bot:
             return self.report("opps")
         if k == "wk":
             return self.weekly_report()
+        if k == "w":
+            return self.wallet_screen(mid) if len(a) == 1 else self.wallet_prompt(a[1], mid)
+        if k == "pr":
+            return self.params_screen(mid) if len(a) == 1 else self.param_prompt(a[1], mid)
 
     # ── primera vez tras actualizar ──────────────────────────────────
 
@@ -1993,7 +2605,7 @@ def get_platforms(cfg, errors, ws_token):
     return platforms, used_ws
 
 
-def live_loop(bot, al, state, cfg, refresh, deadline, data):
+def live_loop(bot, al, state, cfg, refresh, deadline, data, fb=None):
     """Mantiene el bot escuchando Telegram (respuesta casi inmediata) y revisa tus alertas cada minuto."""
     tick = time.time() + cfg["live_refresh_seconds"]
     while True:
@@ -2018,7 +2630,12 @@ def live_loop(bot, al, state, cfg, refresh, deadline, data):
                     al.now = now_utc()
                     evaluate_rules(al, state, platforms)
                     evaluate_opp_alerts(al, cfg, opportunities(platforms, cfg))
+                    record_tick(state, al.now, platforms)
+                    run_rebound(al, cfg, state, fb)
+                    evaluate_wallet(al, cfg, state, platforms)
                     write_json(data / "state.json", state)
+                    if fb is not None:
+                        write_json(data / "feedback.json", fb)
         except Exception as e:  # noqa: BLE001
             print("live error:", repr(e), file=sys.stderr)
             time.sleep(3)
@@ -2043,6 +2660,8 @@ def main():
     hist = read_json(data / "history.json", [])
     state = read_json(data / "state.json", {})
     cfg["alerts"].update(state.get("settings", {}))
+    apply_params(cfg, state)   # lo que cambiaste desde el menú ⚙️ Parámetros
+    apply_wallet(cfg, state)   # tu cartera define el capital de las estimaciones de ganancia
     fb = None
     if FB and cfg["feedback"].get("enabled"):
         fb = read_json(data / "feedback.json", None) or FB.new_store()
@@ -2081,7 +2700,8 @@ def main():
             rec.update({"br": round(p["ref"], 4), "bb": p["best_buy"], "bs": p["best_sell"]})
         if "bybit" in platforms:
             p = platforms["bybit"]
-            rec.update({"yr": round(p["ref"], 4), "yb": p["best_buy"], "ys": p["best_sell"]})
+            rec.update({"yr": round(p["ref"], 4), "yb": p["best_buy"], "ys": p["best_sell"],
+                        "yeb": xb(p), "yes": xs(p)})
         hist.append(rec)
         hist = hist[-cfg["history_max"]:]
 
@@ -2112,6 +2732,23 @@ def main():
         evaluate_alerts(al, cfg, ta, scen, opps, news, platforms, price, prev_label)
         evaluate_rules(al, state, platforms)
         maybe_daily(al, cfg, hist, ta, scen, platforms, news, now)
+        # rebote (Bybit) y cartera: advertencia de contexto para los avisos de compra
+        warn = ""
+        if scen["label"] == "BAJA" and scen["strong"]:
+            warn = f"⚠️ Ojo: el escenario general es BAJA fuerte (puntaje {scen['score']:+.0f}); el rebote puede ser solo un respiro."
+        else:
+            bad = [n for n in news if n.get("important") and n.get("direction") == "baja"
+                   and (now - parse_iso(n["time"])).total_seconds() <= 6 * 3600]
+            if bad:
+                warn = f"📰 Ojo: noticia clave que presiona el dólar a la baja: {bad[0]['title'][:110]}"
+        state["reb_warn"] = warn
+        seed_ticks(state, hist, now)
+        record_tick(state, now, platforms)
+        try:
+            run_rebound(al, cfg, state, fb)
+            evaluate_wallet(al, cfg, state, platforms)
+        except Exception as e:  # noqa: BLE001
+            errors.append(f"Rebote/cartera: {e}")
         if fb is not None:
             try:
                 FB.log_pred(fb, now, price, scen, ta, news)
@@ -2155,7 +2792,7 @@ def main():
     if tg.enabled and not args.demo and not args.dry_run:
         bot.first_run_setup()
         if live > 0:
-            live_loop(bot, al, state, cfg, refresh, t0 + live, data)
+            live_loop(bot, al, state, cfg, refresh, t0 + live, data, fb)
         else:
             bot.poll(0)
             al.flush_due(force=True)
